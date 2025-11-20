@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+env/
+venv/
+.env
+
+node_modules/
+dist/
+.npmrc
+
+# Editor
+.idea/
+.vscode/

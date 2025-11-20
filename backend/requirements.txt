@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+torch
+diffusers
+transformers
+accelerate
+safetensors
+sentencepiece
+Pillow
+python-multipart
