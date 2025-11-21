@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="FLUX Image API")
 
 ALLOWED_ORIGINS: Iterable[str] = (
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    "http://localhost:6970",
+    "http://127.0.0.1:6970",
     "http://localhost",
     "http://127.0.0.1",
 )
@@ -77,8 +77,8 @@ def generate_image(request: TextGenerateRequest) -> ImageResponse:
 async def edit_image(
     file: UploadFile = File(...),
     prompt: str = Form(...),
-    num_inference_steps: int = Form(4),
-    guidance_scale: float = Form(0.0),
+    num_inference_steps: int = Form(28),
+    guidance_scale: float = Form(3.5),
     seed: int | None = Form(None),
 ) -> ImageResponse:
     if not file.content_type or not file.content_type.startswith("image/"):

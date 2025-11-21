@@ -23,6 +23,10 @@ def get_device() -> DeviceType:
 
     Prefers CUDA when available, otherwise falls back to CPU.
     """
+    forced = os.getenv("DEVICE") or os.getenv("FORCE_DEVICE")
+    if forced and forced.lower() == "cpu":
+        logger.warning("Forcing CPU due to DEVICE/FORCE_DEVICE override.")
+        return "cpu"
     if torch.cuda.is_available():
         return "cuda"
     logger.warning("CUDA not available, falling back to CPU. Performance will degrade.")

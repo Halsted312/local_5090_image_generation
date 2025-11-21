@@ -28,19 +28,20 @@ body {
 }
 
 .page {
-  max-width: 1080px;
+  max-width: 1200px;
   margin: 0 auto;
-  padding: 2.5rem 1.25rem 3rem;
+  padding: 1.5rem 1rem 3rem;
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
+  gap: 1.2rem;
 }
 
 .header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .title {
@@ -58,7 +59,8 @@ body {
   font-size: 0.85rem;
 }
 
-.panel {
+.panel,
+.glass {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 16px;
@@ -66,10 +68,10 @@ body {
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
 }
 
-.two-column {
+.layout {
   display: grid;
   grid-template-columns: 1.1fr 0.9fr;
-  gap: 1.25rem;
+  gap: 1rem;
 }
 
 .section-title {
@@ -120,18 +122,124 @@ body {
 
 .inputs-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 0.75rem;
 }
 
-.button {
+.inputs-grid.vertical {
+  grid-template-columns: 1fr;
+}
+
+.hint {
+  color: #9ca3af;
+  font-size: 0.85rem;
+  margin-bottom: 0.2rem;
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.slider-row input[type="range"] {
+  flex: 1;
+  accent-color: #7dd3fc;
+  height: 10px;
+  background: transparent;
+  -webkit-appearance: none;
+}
+
+.slider-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 10px;
+  background: linear-gradient(90deg, #60a5fa, #7dd3fc);
+  border-radius: 999px;
+}
+
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 22px;
+  width: 22px;
+  border-radius: 50%;
+  background: #e8ecf2;
+  border: 3px solid #60a5fa;
+  margin-top: -6px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.slider-row input[type="range"]::-moz-range-track {
+  height: 10px;
+  background: linear-gradient(90deg, #60a5fa, #7dd3fc);
+  border-radius: 999px;
+}
+
+.slider-row input[type="range"]::-moz-range-thumb {
+  height: 22px;
+  width: 22px;
+  border-radius: 50%;
+  background: #e8ecf2;
+  border: 3px solid #60a5fa;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.slider-badge {
+  min-width: 40px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  padding: 0.35rem 0.5rem;
+  font-weight: 700;
+}
+
+.slider-arrows {
+  display: inline-flex;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.slider-arrows button {
+  background: rgba(255, 255, 255, 0.05);
+  border: none;
+  color: #e8ecf2;
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+}
+
+.slider-arrows button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.actions-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.75rem;
+  align-items: start;
+  margin-top: 1rem;
+}
+
+.action-left {
+  min-height: 44px;
+}
+
+.action-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.25rem;
+}
+
+.button,
+.upload-cta {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 0.4rem;
   border: none;
   border-radius: 12px;
-  padding: 0.9rem 1.1rem;
+  padding: 0.85rem 1rem;
   font-weight: 700;
   font-size: 1rem;
   cursor: pointer;
@@ -143,6 +251,24 @@ body {
 .button:hover {
   filter: brightness(1.05);
   transform: translateY(-1px);
+}
+
+.upload-cta {
+  width: fit-content;
+  position: relative;
+  overflow: hidden;
+}
+
+.upload-cta input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.upload-cta.inline {
+  display: inline-flex;
+  margin-bottom: 0.4rem;
 }
 
 .button:disabled {
@@ -186,8 +312,8 @@ body {
 }
 
 .image-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
 }
 
@@ -245,7 +371,16 @@ body {
 }
 
 @media (max-width: 900px) {
-  .two-column {
+  .layout {
     grid-template-columns: 1fr;
+  }
+  .header {
+    flex-direction: column;
+  }
+  .panel {
+    padding: 1rem;
+  }
+  .image-card {
+    max-width: 100%;
   }
 }

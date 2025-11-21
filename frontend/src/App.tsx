@@ -1,5 +1,4 @@
 import { useMemo, useState } from "react";
-import ModeToggle from "./components/ModeToggle";
 import PromptForm from "./components/PromptForm";
 import ImageViewer, { GeneratedImage } from "./components/ImageViewer";
 import { editImage, generateImage } from "./api";
@@ -15,10 +14,9 @@ function makeId() {
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("generate");
-  const [prompt, setPrompt] = useState("");
-  const [steps, setSteps] = useState(4);
-  const [guidance, setGuidance] = useState(0);
-  const [seed, setSeed] = useState<number | null>(null);
+  const [prompt, setPrompt] = useState("show me a cherry tree on a hill");
+  const [steps, setSteps] = useState(6); // UI slider 1-10
+  const [guidance, setGuidance] = useState(2); // UI slider 1-3
   const [file, setFile] = useState<File | null>(null);
   const [images, setImages] = useState<GeneratedImage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -39,13 +37,15 @@ export default function App() {
     return null;
   }, [error, images.length, isLoading]);
 
-  const handleSubmit = async () => {
+  const performRequest = async (opts?: { promptOverride?: string; modeOverride?: Mode }) => {
+    const effectiveMode = opts?.modeOverride ?? mode;
+    const effectivePrompt = opts?.promptOverride ?? prompt;
     setError(null);
-    if (!prompt.trim()) {
+    if (!effectivePrompt.trim()) {
       setError("Prompt is required.");
       return;
     }
-    if (mode === "edit" && !file) {
+    if (effectiveMode === "edit" && !file) {
       setError("Upload an image to edit.");
       return;
     }
@@ -53,28 +53,30 @@ export default function App() {
     setIsLoading(true);
     try {
       let imageBase64: string;
-      if (mode === "generate") {
+      if (effectiveMode === "generate") {
+        const mappedSteps = Math.round(4 + (steps - 1) * 0.5); // ~4–8.5
+        const mappedGuidance = guidance === 1 ? 0 : guidance - 1; // 0–2
         imageBase64 = await generateImage({
-          prompt,
-          num_inference_steps: steps,
-          guidance_scale: guidance,
+          prompt: effectivePrompt,
+          num_inference_steps: mappedSteps,
+          guidance_scale: mappedGuidance,
           width: 1024,
           height: 1024,
-          seed: seed ?? undefined,
         });
       } else {
-        imageBase64 = await editImage(file!, prompt, {
-          num_inference_steps: steps,
-          guidance_scale: guidance,
-          seed,
+        const mappedSteps = Math.min(40, Math.round(10 + (steps - 1) * 3)); // ~10–37
+        const mappedGuidance = 1 + (guidance - 1) * 1.5; // 1.0–3.0
+        imageBase64 = await editImage(file!, effectivePrompt, {
+          num_inference_steps: mappedSteps,
+          guidance_scale: mappedGuidance,
         });
       }
 
       const newImage: GeneratedImage = {
         id: makeId(),
         src: imageBase64,
-        mode,
-        prompt,
+        mode: effectiveMode,
+        prompt: effectivePrompt,
       };
       setImages((prev) => [newImage, ...prev]);
     } catch (err) {
@@ -84,36 +86,50 @@ export default function App() {
     }
   };
 
+  const handleSubmit = async () => {
+    await performRequest();
+  };
+
   return (
     <div className="page">
-      <div className="header">
-        <div>
-          <div className="pill">FLUX + FastAPI + Vite</div>
-          <div className="title">Face Style Studio</div>
-          <p style={{ color: "#9ca3af", marginTop: "0.3rem" }}>
-            Upload a face, describe the body/look, and FLUX will craft the shot.
-          </p>
-        </div>
+      <div className="header" style={{ flexDirection: "column", alignItems: "center" }}>
+        <div className="title">Imgen 4 U</div>
+        <p style={{ color: "#9ca3af", marginTop: "0.2rem", textAlign: "center" }}>
+          Describe a look or upload a photo to transform it. GPU-powered edits and generations.
+        </p>
       </div>
 
-      <div className="two-column">
-        <div>
-          <div className="section-title">Mode</div>
-          <ModeToggle mode={mode} onChange={handleModeChange} />
+      <div className="layout">
+        <div className="panel">
+          <div className="section-title">Choose how to work</div>
+          <div className="mode-toggle">
+            <button
+              type="button"
+              className={`mode-button ${mode === "generate" ? "active" : ""}`}
+              onClick={() => handleModeChange("generate")}
+            >
+              ✨ Generate from text
+            </button>
+            <button
+              type="button"
+              className={`mode-button ${mode === "edit" ? "active" : ""}`}
+              onClick={() => handleModeChange("edit")}
+            >
+              📤 Upload photo
+            </button>
+          </div>
           <div style={{ marginTop: "0.9rem" }}>
             <PromptForm
               mode={mode}
               prompt={prompt}
               steps={steps}
               guidance={guidance}
-              seed={seed}
               file={file}
               error={error}
               isLoading={isLoading}
               onPromptChange={setPrompt}
               onStepsChange={setSteps}
               onGuidanceChange={setGuidance}
-              onSeedChange={setSeed}
               onFileChange={setFile}
               onSubmit={handleSubmit}
             />

@@ -24,6 +24,7 @@ export default function ImageViewer({ images }: ImageViewerProps) {
           <span className={`image-badge ${img.mode === "generate" ? "badge-generate" : "badge-edit"}`}>
             {img.mode === "generate" ? "Generated" : "Edited"}
           </span>
+          <div style={{ padding: "0.75rem", color: "#cbd5e1", fontSize: "0.9rem" }}>{img.prompt}</div>
         </div>
       ))}
     </div>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import os
 
 import torch
 from diffusers import FluxKontextPipeline, FluxPipeline
@@ -20,15 +21,23 @@ _lock = threading.Lock()
 def _load_text_pipeline() -> FluxPipeline:
     """Instantiate the text-to-image FLUX pipeline."""
     device = get_device()
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
     logger.info("Loading FLUX text-to-image pipeline (%s) on %s", FLUX_TEXT_MODEL_ID, device)
     try:
+        if device == "cuda":
+            torch.cuda.empty_cache()
         pipeline = FluxPipeline.from_pretrained(
             FLUX_TEXT_MODEL_ID,
             torch_dtype=torch.bfloat16,
+            token=token,
         )
-        pipeline.to(device)
-        # Uncomment if you need to conserve VRAM.
-        # pipeline.enable_model_cpu_offload()
+        try:
+            pipeline.to(device)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("Text pipeline OOM on GPU; enabling CPU offload.")
+            pipeline.enable_model_cpu_offload()
+        pipeline.enable_attention_slicing()
+        pipeline.enable_vae_slicing()
     except Exception as exc:
         logger.exception("Failed to initialize FLUX text pipeline")
         raise RuntimeError(f"Failed to load FLUX text pipeline: {exc}") from exc
@@ -38,15 +47,23 @@ def _load_text_pipeline() -> FluxPipeline:
 def _load_kontext_pipeline() -> FluxKontextPipeline:
     """Instantiate the image-editing FLUX Kontext pipeline."""
     device = get_device()
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
     logger.info("Loading FLUX Kontext pipeline (%s) on %s", FLUX_KONTEXT_MODEL_ID, device)
     try:
+        if device == "cuda":
+            torch.cuda.empty_cache()
         pipeline = FluxKontextPipeline.from_pretrained(
             FLUX_KONTEXT_MODEL_ID,
             torch_dtype=torch.bfloat16,
+            token=token,
         )
-        pipeline.to(device)
-        # Uncomment if you need to conserve VRAM.
-        # pipeline.enable_model_cpu_offload()
+        try:
+            pipeline.to(device)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("Kontext pipeline OOM on GPU; enabling CPU offload.")
+            pipeline.enable_model_cpu_offload()
+        pipeline.enable_attention_slicing()
+        pipeline.enable_vae_slicing()
     except Exception as exc:
         logger.exception("Failed to initialize FLUX Kontext pipeline")
         raise RuntimeError(f"Failed to load FLUX Kontext pipeline: {exc}") from exc

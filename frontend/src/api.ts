@@ -7,7 +7,7 @@ export interface TextGenerateRequest {
   seed?: number | null;
 }
 
-const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:6969";
 
 async function handleResponse(res: Response): Promise<string> {
   if (!res.ok) {
