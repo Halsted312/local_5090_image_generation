@@ -10,9 +10,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Default model IDs; can be overridden via environment variables.
+# Default model ID; can be overridden via environment variables.
 FLUX_TEXT_MODEL_ID: str = os.getenv("FLUX_TEXT_MODEL_ID", "black-forest-labs/FLUX.1-schnell")
-FLUX_KONTEXT_MODEL_ID: str = os.getenv("FLUX_KONTEXT_MODEL_ID", "black-forest-labs/FLUX.1-Kontext-dev")
 
 DeviceType = Literal["cuda", "cpu"]
 

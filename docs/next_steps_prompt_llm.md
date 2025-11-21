@@ -1,5 +1,7 @@
 Got it—that makes total sense. We’ll keep the prank architecture, but **swap out vector similarity for a small local LLM** that answers:
 
+> **Note:** We’re now targeting text-to-image only (no uploads). Keep the prank flow ideas for reference, but ignore any upload requirements when following these notes.
+
 > “Does this new prompt mean the same thing as any of these trap prompts?”
 
 If **yes → return the uploaded prank image**.

@@ -1,6 +1,6 @@
 # Flexy Face (FLUX)
 
-Full-stack app for FLUX image generation and editing. Users can upload a face/body reference, describe the style they want, and receive a stylized image back. The stack is FastAPI + diffusers (FLUX pipelines) on the backend and React + Vite on the frontend.
+Full-stack app for FLUX text-to-image generation. Describe the style you want and the stack (FastAPI + diffusers on the backend and React + Vite on the frontend) will render it from scratch.
 
 ## Quick start with Docker
 
@@ -32,12 +32,11 @@ npm install
 npm run dev -- --port 6970
 ```
 
-Quick test: open `http://localhost:6970`, click “Run sample: cherry tree on a hill”, and you should see the generated image. UI is mobile-friendly: controls stack on top, output below with recent images.
+Quick test: open `http://localhost:6970`, craft a prompt (e.g. “cherry tree on a hill”), and you should see the generated image. UI is mobile-friendly: controls stack on top, output below with recent images.
 
 ## Flow
 
 - `/api/generate`: text → image (FLUX.1 Schnell by default).
-- `/api/edit`: upload image + prompt → edited image (FLUX.1 Kontext).
-- Frontend toggles between generate/edit, supports prompt, steps, guidance, optional seed, and file upload (edit mode).
+- Frontend supports prompt, steps, guidance, and optional seed.
 
 See `docs/AGENT_INSTRUCTIONS.md` for the original build brief.

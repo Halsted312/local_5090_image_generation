@@ -6,11 +6,11 @@ import logging
 from typing import Iterable
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-from .flux_models import get_kontext_pipeline, get_text_pipeline
+from .flux_models import get_text_pipeline
 from .schemas import ImageResponse, TextGenerateRequest
 
 logging.basicConfig(level=logging.INFO)
@@ -71,39 +71,3 @@ def generate_image(request: TextGenerateRequest) -> ImageResponse:
         raise HTTPException(status_code=500, detail="Image generation failed") from exc
 
     return ImageResponse(image_base64=_pil_to_base64_png(image))
-
-
-@app.post("/api/edit", response_model=ImageResponse)
-async def edit_image(
-    file: UploadFile = File(...),
-    prompt: str = Form(...),
-    num_inference_steps: int = Form(28),
-    guidance_scale: float = Form(3.5),
-    seed: int | None = Form(None),
-) -> ImageResponse:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
-
-    payload = await file.read()
-    try:
-        init_image = Image.open(io.BytesIO(payload)).convert("RGB")
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail="Failed to parse image") from exc
-
-    pipe = get_kontext_pipeline()
-    device = getattr(pipe, "device", "cpu")
-    generator = _make_generator(device, seed)
-    try:
-        result = pipe(
-            image=init_image,
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-        )
-        edited_image = result.images[0]
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Image editing failed")
-        raise HTTPException(status_code=500, detail="Image editing failed") from exc
-
-    return ImageResponse(image_base64=_pil_to_base64_png(edited_image))

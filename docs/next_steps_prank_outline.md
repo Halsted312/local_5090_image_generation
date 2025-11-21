@@ -1,5 +1,7 @@
 Here’s a concrete plan + stub code you can hand straight to your coding agent.
 
+> **Note:** The current direction is text-to-image only—no user uploads. Keep the FLUX prank concepts for inspiration, but skip the upload-backed steps when applying this outline.
+
 I’ll:
 
 * Plug a **local “small model”** for prompt similarity on your 5090 (BGE small via `sentence-transformers`) ([Hugging Face][1])

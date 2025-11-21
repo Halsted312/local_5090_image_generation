@@ -1,46 +1,26 @@
-import { useEffect, useMemo, useRef } from "react";
-
-type Mode = "generate" | "edit";
-
 interface PromptFormProps {
-  mode: Mode;
   prompt: string;
   steps: number;
   guidance: number;
-  file: File | null;
   error?: string | null;
   isLoading: boolean;
   onPromptChange: (value: string) => void;
   onStepsChange: (value: number) => void;
   onGuidanceChange: (value: number) => void;
-  onFileChange: (file: File | null) => void;
   onSubmit: () => void;
 }
 
 export default function PromptForm({
-  mode,
   prompt,
   steps,
   guidance,
-  file,
   error,
   isLoading,
   onPromptChange,
   onStepsChange,
   onGuidanceChange,
-  onFileChange,
   onSubmit,
 }: PromptFormProps) {
-  const previewUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-      }
-    };
-  }, [previewUrl]);
 
   return (
     <form
@@ -110,30 +90,7 @@ export default function PromptForm({
       </div>
 
       <div className="actions-row">
-        <div className="action-left">
-          {mode === "edit" ? (
-            <>
-              <label className="upload-cta inline" onClick={() => fileInputRef.current?.click()}>
-                <span>📤 Choose an image</span>
-                <input
-                  ref={fileInputRef}
-                  id="file"
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => onFileChange(e.target.files?.[0] ?? null)}
-                />
-              </label>
-              {file && <div className="file-info">Selected: {file.name}</div>}
-              {previewUrl && (
-                <div className="file-preview">
-                  <img src={previewUrl} alt="Preview" />
-                </div>
-              )}
-            </>
-          ) : (
-            <div style={{ minHeight: "44px" }} />
-          )}
-        </div>
+        <div className="action-left" />
         <div className="action-right">
           <button className="button" type="submit" disabled={isLoading}>
             {isLoading ? "Working..." : "Generate image"}
