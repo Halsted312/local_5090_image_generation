@@ -1,4 +1,15 @@
 services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: flexyface
+      POSTGRES_PASSWORD: flexypass
+      POSTGRES_DB: flexyface
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "7432:5432"
+
   backend:
     build: ./backend
     env_file:
@@ -6,10 +17,16 @@ services:
     environment:
       - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN:-}
       - HF_HUB_ENABLE_HF_TRANSFER=1
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://flexyface:flexypass@db:5432/flexyface}
+      - PRANK_IMAGE_ROOT=/data/prank_images
+      - PRANK_LLM_ID=${PRANK_LLM_ID:-meta-llama/Meta-Llama-3-8B-Instruct}
     volumes:
       - hf_cache:/root/.cache/huggingface
+      - ./prank_images:/data/prank_images
     ports:
-      - "6969:6969"
+      - "7999:7999"
+    depends_on:
+      - db
     deploy:
       resources:
         reservations:
@@ -21,9 +38,10 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "6970:80"
+      - "7080:80"
     depends_on:
       - backend
 
 volumes:
   hf_cache:
+  db_data:

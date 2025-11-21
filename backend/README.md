@@ -24,13 +24,15 @@ export HUGGINGFACE_HUB_TOKEN=hf_your_token
 Run the API:
 
 ```bash
-uvicorn app.main:app --reload --port 6969
+uvicorn app.main:app --reload --port 7999
 ```
 
 ## Endpoints
 
 - `GET /health` – health check.
 - `POST /api/generate` – JSON body (`TextGenerateRequest`) for text-to-image. Returns `{ "image_base64": "..." }`.
-- `POST /api/edit` – `multipart/form-data` with `file` (image) and `prompt`. Returns `{ "image_base64": "..." }`.
+- `POST /api/pranks` – create a prank slug.
+- `POST /api/pranks/{prank_id}/triggers` – attach stored prank images to triggers (operator-only, references local files).
+- `POST /api/p/{slug}/generate` – prank endpoint that returns a stored image on a trap match; otherwise falls back to FLUX.
 
 Pipeline defaults target CUDA; CPU is used as a fallback, but performance will degrade.

@@ -10,3 +10,5 @@ Pillow
 python-multipart
 protobuf
 hf-transfer
+sqlalchemy
+psycopg2-binary

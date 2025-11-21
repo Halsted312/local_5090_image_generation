@@ -1,7 +1,11 @@
 import { useMemo, useState } from "react";
 import PromptForm from "./components/PromptForm";
 import ImageViewer, { GeneratedImage } from "./components/ImageViewer";
-import { generateImage } from "./api";
+import { generatePrankImage } from "./api";
+
+interface PrankPlayAppProps {
+  slug: string;
+}
 
 function makeId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -10,8 +14,8 @@ function makeId() {
   return Math.random().toString(36).slice(2);
 }
 
-export default function App() {
-  const [prompt, setPrompt] = useState("show me a cherry tree on a hill");
+export default function PrankPlayApp({ slug }: PrankPlayAppProps) {
+  const [prompt, setPrompt] = useState("");
   const [steps, setSteps] = useState(6); // UI slider 1-10
   const [guidance, setGuidance] = useState(2); // UI slider 1-3
   const [images, setImages] = useState<GeneratedImage[]>([]);
@@ -19,16 +23,16 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const statusText = useMemo(() => {
-    if (isLoading) return "Working with FLUX...";
+    if (isLoading) return "Generating image...";
     if (error) return null;
-    if (images.length > 0) return "Done. Add another variation.";
+    if (images.length > 0) return "Done. Try another idea.";
     return null;
   }, [error, images.length, isLoading]);
 
-  const performRequest = async (opts?: { promptOverride?: string }) => {
-    const effectivePrompt = opts?.promptOverride ?? prompt;
+  const handleSubmit = async () => {
     setError(null);
-    if (!effectivePrompt.trim()) {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
       setError("Prompt is required.");
       return;
     }
@@ -37,18 +41,18 @@ export default function App() {
     try {
       const mappedSteps = Math.round(4 + (steps - 1) * 0.5); // ~4–8.5
       const mappedGuidance = guidance === 1 ? 0 : guidance - 1; // 0–2
-      const imageBase64 = await generateImage({
-        prompt: effectivePrompt,
+
+      const imageBase64 = await generatePrankImage(slug, {
+        prompt: trimmed,
         num_inference_steps: mappedSteps,
         guidance_scale: mappedGuidance,
         width: 640,
         height: 640,
       });
-
       const newImage: GeneratedImage = {
         id: makeId(),
         src: imageBase64,
-        prompt: effectivePrompt,
+        prompt: trimmed,
         mode: "generate",
       };
       setImages((prev) => [newImage, ...prev]);
@@ -59,16 +63,12 @@ export default function App() {
     }
   };
 
-  const handleSubmit = async () => {
-    await performRequest();
-  };
-
   return (
     <div className="page">
       <div className="header" style={{ flexDirection: "column", alignItems: "center" }}>
         <div className="title">Prompt Pics</div>
         <p style={{ color: "#9ca3af", marginTop: "0.2rem", textAlign: "center" }}>
-          Describe a look and FLUX will paint it from scratch. GPU-powered generations only.
+          Type a description and we&apos;ll generate it for you.
         </p>
       </div>
 

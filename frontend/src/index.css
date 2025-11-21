@@ -370,6 +370,59 @@ body {
   width: 100%;
 }
 
+.file-preview.small img {
+  width: 160px;
+  height: auto;
+}
+
+.trigger-table {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}
+
+.trigger-table-head,
+.trigger-table-row {
+  display: grid;
+  grid-template-columns: 60px 1.5fr 1fr 120px;
+  align-items: start;
+  gap: 0.6rem;
+}
+
+.trigger-table-head {
+  font-weight: 700;
+  color: #c3c8d4;
+  font-size: 0.9rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding-bottom: 0.3rem;
+}
+
+.trigger-table-row {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.trigger-col textarea {
+  min-height: 80px;
+}
+
+.index-col {
+  font-weight: 700;
+  color: #a78bfa;
+}
+
+.image-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.action-col {
+  display: flex;
+  align-items: center;
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 1fr;

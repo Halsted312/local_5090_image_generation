@@ -17,3 +17,6 @@ frontend/vite.config.d.ts
 # Editor
 .idea/
 .vscode/
+
+# Local prank image storage
+prank_images/
