@@ -1,6 +1,6 @@
-# Flexy Face (FLUX)
+# PromptPics / Flexy Face (API)
 
-Full-stack app for FLUX text-to-image generation. Describe the style you want and the stack (FastAPI + diffusers on the backend and React + Vite on the frontend) will render it from scratch.
+API for FLUX text-to-image generation with prank-link support. Backend lives on your machine (GPU), frontend is now handled separately (e.g., Replit at `https://promptpics.ai`). The old React app is archived in `frontend_archive_ignore/` for reference.
 
 ## Quick start with Docker
 
@@ -9,7 +9,7 @@ cp .env.example .env   # add your Hugging Face token if models are gated
 docker compose up --build
 ```
 
-Backend will be on `http://localhost:7999`, frontend on `http://localhost:7080` (served by Nginx). A Postgres container is included for prank metadata, and `./prank_images` is bind-mounted into the backend at `/data/prank_images`. If you want GPU acceleration inside the backend container, run Docker with GPU support (e.g., `docker compose --profile gpu up` or set your Docker runtime to NVIDIA).
+Backend API will be on `http://localhost:7999`. A Postgres container is included for prank metadata, and `./prank_images` is bind-mounted into the backend at `/data/prank_images`. If you want GPU acceleration inside the backend container, run Docker with GPU support (e.g., `docker compose --profile gpu up` or set your Docker runtime to NVIDIA).
 
 Expose via `app.promptpics.ai` (ngrok):
 - Reserve `app.promptpics.ai` in the ngrok dashboard and add the provided CNAME in GoDaddy pointing to your domain.
@@ -30,16 +30,6 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 7999
 ```
 
-Frontend:
-
-```bash
-cd frontend
-npm install
-npm run dev -- --port 7080
-```
-
-Quick test: open `http://localhost:7080`, craft a prompt (e.g. “cherry tree on a hill”), and you should see the generated image. UI is mobile-friendly: controls stack on top, output below with recent images.
-
 ## Flow
 
 - `/api/generate`: text → image (FLUX.1 Schnell by default).
@@ -48,6 +38,29 @@ Quick test: open `http://localhost:7080`, craft a prompt (e.g. “cherry tree on
 - Place prank assets under `./prank_images/<slug>/...` on the host; triggers reference paths relative to that folder.
 
 See `docs/AGENT_INSTRUCTIONS.md` for the original build brief.
+
+## Current architecture (API-only)
+- Backend (FastAPI) on port 7999, exposed via ngrok at `https://app.promptpics.ai`.
+- CORS allows: `https://promptpics.ai`, `https://*.replit.app`, `http://localhost:3000`, `https://app.promptpics.ai`.
+- Frontend is now hosted elsewhere (Replit). The archived local UI lives in `frontend_archive_ignore/` (docker-compose still builds it for dev if needed).
+
+## Ngrok
+- Config: `~/.config/ngrok/ngrok.yml` with endpoint `promptpics` → upstream `7999`.
+- Start manually: `./scripts/start_ngrok_promptpics.sh`
+- Docs: `docs/ngrok-promptpics.md`
+
+## Systemd (optional, not installed by default)
+See `docs/systemd-promptpics.md` for units to auto-start Docker and ngrok on boot.
+
+## Replit integration (quick notes)
+- Point the Replit frontend to `https://app.promptpics.ai` for all API calls.
+- Use endpoints:
+  - `POST /api/generate`
+  - `POST /api/pranks`
+  - `POST /api/pranks/{prank_id}/triggers` (multipart image + `trigger_text`)
+  - `POST /api/p/{slug}/generate`
+  - `GET /api/pranks/{slug}` (fetch existing triggers)
+- Ensure Replit origin matches CORS list (`https://promptpics.ai` or `*.replit.app`).
 
 ````markdown
 # PromptPics / PromptPix Project Summary  
