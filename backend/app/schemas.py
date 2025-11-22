@@ -39,22 +39,22 @@ class MatchedTrigger(BaseModel):
 
 
 class ImageResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     image_base64: str
     generation_id: str | None = None
     model_id: str | None = None
     model_used: str | None = None
-    was_prank: bool | None = None
+    was_prank: bool | None = Field(None, alias="was_prank", serialization_alias="wasPrank")
     matched_trigger_id: str | None = Field(None, alias="matched_trigger_id", serialization_alias="matched_trigger_id")
     matched_trigger_text: str | None = Field(
-        None, alias="matched_trigger_text", serialization_alias="matched_triggerText"
+        None, alias="matched_trigger_text", serialization_alias="matchedTriggerText"
     )
     generation_time_ms: int | None = None
     thumbnail_base64: str | None = None
     image_path: str | None = None
     thumbnail_path: str | None = None
     router_metadata: RoutingMetadata | None = None
-    is_prank_match: bool | None = None
+    is_prank_match: bool | None = Field(None, alias="is_prank_match", serialization_alias="isPrankMatch")
     matched_trigger: MatchedTrigger | None = None
 
 
@@ -64,7 +64,7 @@ class PrankMetadataCreate(BaseModel):
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
 
 class PrankCreateResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
     slug: str  # share slug
     builder_slug: str = Field(..., alias="builderSlug")
@@ -84,7 +84,7 @@ class PrankTriggerCreateRequest(BaseModel):
 
 
 class PrankTriggerCreateResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
     trigger_text: str = Field(..., alias="triggerText")
     image_path: str = Field(..., alias="imagePath")
@@ -105,11 +105,12 @@ class PrankGenerateRequest(BaseModel):
     )
 
 class PrankTriggerUpdateRequest(BaseModel):
-    trigger_text: str = Field(..., description="Updated trigger text")
+    model_config = ConfigDict(populate_by_name=True)
+    trigger_text: str = Field(..., alias="triggerText", description="Updated trigger text")
 
 
 class PrankTriggerInfo(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
     trigger_text: str = Field(..., alias="triggerText")
     image_base64: str = Field(..., alias="imageBase64")
@@ -118,7 +119,7 @@ class PrankTriggerInfo(BaseModel):
     match_count: int = Field(0, alias="matchCount")
 
 class PrankDetailResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
     slug: str
     builder_slug: str = Field(..., alias="builderSlug")
@@ -130,14 +131,37 @@ class PrankDetailResponse(BaseModel):
     view_count: int = Field(..., alias="viewCount")
     triggers: list[PrankTriggerInfo]
 
+
+class PrankSummary(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+    id: str
+    slug: str
+    builder_slug: str = Field(..., alias="builderSlug")
+    title: str | None
+    session_id: str | None = Field(None, alias="sessionId")
+    share_url: str = Field(..., alias="shareUrl")
+    builder_url: str = Field(..., alias="builderUrl")
+    created_at: str = Field(..., alias="createdAt")
+    view_count: int = Field(..., alias="viewCount")
+    trigger_count: int = Field(..., alias="triggerCount")
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+class AdminLoginResponse(BaseModel):
+    admin_token: str
+
+
 class GenerationLogEntry(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
     prompt: str
     model_id: str
-    image_path: str
-    thumbnail_path: str
-    created_at: str
-    share_slug: str | None = None
-    router_json: dict | None = None
-    session_id: str | None = Field(None, alias="sessionId")
+    image_path: str = Field(..., alias="image_path", serialization_alias="imagePath")
+    thumbnail_path: str = Field(..., alias="thumbnail_path", serialization_alias="thumbnailPath")
+    created_at: str = Field(..., alias="created_at", serialization_alias="createdAt")
+    share_slug: str | None = Field(None, alias="share_slug", serialization_alias="shareSlug")
+    router_json: dict | None = Field(None, alias="router_json", serialization_alias="routerJson")
+    session_id: str | None = Field(None, alias="sessionId", serialization_alias="sessionId")

@@ -89,11 +89,7 @@ def heuristic_match(prompt: str, triggers: List[str]) -> Tuple[Optional[int], Li
         scores[i] = score
         if score > best_score:
             best_score = score
-        best_idx = i
-
-    # confidence threshold
-    if best_score >= 0.7:
-        return best_idx, scores
+            best_idx = i
 
     return None, scores
 

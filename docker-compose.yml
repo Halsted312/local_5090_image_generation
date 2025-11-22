@@ -20,6 +20,7 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://flexyface:flexypass@db:5432/flexyface}
       - PRANK_IMAGE_ROOT=/data/prank_images
       - PRANK_LLM_ID=${PRANK_LLM_ID:-meta-llama/Meta-Llama-3-8B-Instruct}
+      - ADMIN_PASSWORD=Halsted312Fwed11-11
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./prank_images:/data/prank_images

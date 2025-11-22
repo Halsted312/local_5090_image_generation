@@ -1,6 +1,10 @@
 import pytest
 
+# Only run these tests if torch is available (prank_matching imports torch).
+torch = pytest.importorskip("torch")
+
 from backend.app.prank_matching import get_prank_matcher_llm, match_prank_trigger
+from backend.app.prank_matching import heuristic_match
 
 
 @pytest.fixture(scope="module")
@@ -32,3 +36,13 @@ def test_near_match_uses_llm_when_available(matcher):
     assert idx == 0
     assert debug.final_idx == 0
     assert debug.used_llm is True
+
+
+def test_heuristic_match_returns_best_index():
+    prompt = "cat with sunglasses"
+    triggers = ["cat with sunglasses", "dog", "car"]
+
+    idx, scores = heuristic_match(prompt, triggers)
+
+    assert idx == 0
+    assert scores[0] >= 0.7

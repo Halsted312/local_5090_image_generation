@@ -6,14 +6,15 @@ import json
 import logging
 import os
 import random
+import secrets
 import string
 import threading
 import time
 from typing import Iterable
 
 import torch
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi import File, Form, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import File, Form, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image
@@ -29,6 +30,7 @@ from .flux_models import (
 )
 from .models import GenerationLog, Prank, PrankTrigger
 from .prank_matching import get_prank_matcher_llm, match_prank_trigger
+from .model_registry import MODEL_REGISTRY
 from .router_engine import RoutingDecision, route_prompt
 from .schemas import (
     ImageResponse,
@@ -40,9 +42,12 @@ from .schemas import (
     PrankTriggerCreateResponse,
     PrankTriggerInfo,
     PrankTriggerUpdateRequest,
+    PrankSummary,
     RoutingMetadata,
     TextGenerateRequest,
     GenerationLogEntry,
+    AdminLoginRequest,
+    AdminLoginResponse,
 )
 from .storage import (
     GEN_IMAGE_ROOT,
@@ -60,20 +65,29 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="FLUX Image API + Prank Mode")
 
 PRANK_DELAY_MS = int(os.getenv("PRANK_DELAY_MS", "0") or "0")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+ADMIN_TOKEN = secrets.token_urlsafe(32)
+ADMIN_TOKEN_ISSUED = time.time()
+ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", str(24 * 3600)) or str(24 * 3600))
+ADMIN_LOGIN_WINDOW = int(os.getenv("ADMIN_LOGIN_WINDOW", "60") or "60")
+ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "10") or "10")
 
 ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
-    "https://*.replit.app",
-    "http://localhost:3000",
+    "https://www.promptpics.ai",
     "https://app.promptpics.ai",
+    "https://promptpics.replit.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    # Using wildcard to support dynamic Replit origins; tighten later if needed.
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=list(ALLOWED_ORIGINS),
+    # Allow dynamic Replit preview domains
+    allow_origin_regex=r"https://.*\.replit\.app",
+    allow_credentials=False,  # frontend sends credentials: 'omit'
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -183,6 +197,66 @@ def _sleep_prank_delay() -> None:
     """Artificial delay for prank matches to mimic generation time."""
     if PRANK_DELAY_MS > 0:
         time.sleep(PRANK_DELAY_MS / 1000.0)
+
+
+def require_admin(x_admin_token: str = Header(..., alias="X-Admin-Token")) -> None:
+    # Expire tokens after TTL; force re-login.
+    if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
+        raise HTTPException(status_code=401, detail="Admin token expired; please login again")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+
+@app.middleware("http")
+async def block_dotfiles(request: Request, call_next):
+    """
+    Deny access to dotfiles and VCS paths (e.g., /.git) defensively.
+    """
+    path = request.url.path
+    if path.startswith("/.") or "/.git" in path:
+        logger.warning("Blocked dotfile/VCS path: path=%s ip=%s", path, _client_ip(request))
+        return Response(status_code=404)
+    # Light logging for obviously suspicious probes
+    for marker in ("/wp-login", "/wp-admin", "/phpmyadmin", "/config.php", "/etc/passwd"):
+        if marker in path:
+            logger.warning("Suspicious probe blocked: path=%s ip=%s", path, _client_ip(request))
+            return Response(status_code=404)
+    return await call_next(request)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _check_admin_rate_limit(request: Request) -> None:
+    """
+    Simple in-memory rate limiter per client IP for admin login.
+    """
+    ip = _client_ip(request)
+    now = time.time()
+    attempts = getattr(app.state, "admin_login_attempts", None)
+    if attempts is None:
+        attempts = {}
+        app.state.admin_login_attempts = attempts
+    window = ADMIN_LOGIN_WINDOW
+    limit = ADMIN_LOGIN_MAX_ATTEMPTS
+    history = [t for t in attempts.get(ip, []) if now - t < window]
+    if len(history) >= limit:
+        raise HTTPException(status_code=429, detail="Too many admin login attempts; try again later")
+    history.append(now)
+    attempts[ip] = history
+
+
+def _issue_admin_token() -> str:
+    global ADMIN_TOKEN, ADMIN_TOKEN_ISSUED
+    ADMIN_TOKEN = secrets.token_urlsafe(32)
+    ADMIN_TOKEN_ISSUED = time.time()
+    return ADMIN_TOKEN
 
 
 def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.Image, str]:
@@ -315,6 +389,30 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/admin/login", response_model=AdminLoginResponse)
+def admin_login(payload: AdminLoginRequest, request: Request) -> AdminLoginResponse:
+    # rate-limit attempts per client
+    _check_admin_rate_limit(request)
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=500, detail="Admin password not configured")
+    if payload.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    token = _issue_admin_token()
+    return AdminLoginResponse(admin_token=token)
+
+
+@app.post("/api/admin/verify")
+def admin_verify(_: None = Depends(require_admin)) -> dict:
+    """Simple admin token verification endpoint."""
+    return {"status": "ok"}
+
+
+@app.options("/api/generate")
+async def generate_options() -> Response:
+    """Explicit preflight handler; CORSMiddleware adds headers."""
+    return Response(status_code=200)
+
+
 @app.post("/api/generate", response_model=ImageResponse)
 def generate_image(
     request: TextGenerateRequest,
@@ -348,6 +446,24 @@ def _prank_to_response(prank: Prank, triggers: list[PrankTrigger]) -> dict:
             }
             for t in triggers
         ],
+    }
+
+
+def _prank_to_summary(prank: Prank, trigger_count: int) -> dict:
+    base_url = os.getenv("FRONTEND_BASE_URL", "https://promptpics.ai")
+    share_slug = prank.share_slug
+    builder_slug = prank.builder_slug
+    return {
+        "id": str(prank.id),
+        "slug": share_slug,
+        "builderSlug": builder_slug,
+        "title": prank.title,
+        "sessionId": prank.session_id,
+        "shareUrl": f"{base_url}/p/{share_slug}",
+        "builderUrl": f"{base_url}/customize/{builder_slug}",
+        "createdAt": prank.created_at.isoformat() if prank.created_at else None,
+        "viewCount": prank.view_count or 0,
+        "triggerCount": trigger_count,
     }
 
 
@@ -407,7 +523,10 @@ def get_prank_alias(slug: str, db: Session = Depends(get_db)) -> PrankDetailResp
 
 
 @app.get("/api/pranks", response_model=list[PrankDetailResponse])
-def list_pranks(session_id: str | None = Query(None), db: Session = Depends(get_db)) -> list[PrankDetailResponse]:
+def list_pranks(
+    session_id: str | None = Query(None, alias="sessionId"),
+    db: Session = Depends(get_db),
+) -> list[PrankDetailResponse]:
     """
     List prank sets owned by the provided session_id. Returns [] when session_id is missing.
     """
@@ -431,6 +550,62 @@ def list_pranks(session_id: str | None = Query(None), db: Session = Depends(get_
         )
         payload = _prank_to_response(prank, triggers)
         results.append(PrankDetailResponse(**payload))
+    return results
+
+
+@app.get("/api/pranks/summaries", response_model=list[PrankSummary])
+def list_prank_summaries(
+    session_id: str | None = Query(None, alias="sessionId"),
+    db: Session = Depends(get_db),
+) -> list[PrankSummary]:
+    """
+    Lightweight prank summaries without base64 payloads.
+    """
+    if not session_id:
+        return []
+
+    pranks = (
+        db.query(Prank)
+        .filter(Prank.session_id == session_id)
+        .order_by(Prank.created_at.desc())
+        .all()
+    )
+
+    results: list[PrankSummary] = []
+    for prank in pranks:
+        trigger_count = (
+            db.query(PrankTrigger)
+            .filter(PrankTrigger.prank_id == prank.id)
+            .count()
+        )
+        payload = _prank_to_summary(prank, trigger_count)
+        results.append(PrankSummary(**payload))
+    return results
+
+
+@app.get("/api/admin/pranks", response_model=list[PrankSummary])
+def admin_list_pranks(
+    _: None = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[PrankSummary]:
+    """
+    Admin-only list of all pranks (summary only, no base64 payloads).
+    """
+    pranks = (
+        db.query(Prank)
+        .order_by(Prank.created_at.desc())
+        .all()
+    )
+
+    results: list[PrankSummary] = []
+    for prank in pranks:
+        trigger_count = (
+            db.query(PrankTrigger)
+            .filter(PrankTrigger.prank_id == prank.id)
+            .count()
+        )
+        payload = _prank_to_summary(prank, trigger_count)
+        results.append(PrankSummary(**payload))
     return results
 
 
@@ -629,9 +804,12 @@ def update_prank_trigger_by_slug(
     slug: str,
     trigger_id: str,
     payload: PrankTriggerUpdateRequest,
+    session_id: str | None = Query(None, alias="sessionId"),
     db: Session = Depends(get_db),
 ) -> PrankTriggerCreateResponse:
     prank = _get_prank_by_slug(db, slug)
+    if prank.session_id and session_id and prank.session_id != session_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
     trigger = (
         db.query(PrankTrigger)
         .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
@@ -674,9 +852,12 @@ def delete_prank_trigger(
 def delete_prank_trigger_by_slug(
     slug: str,
     trigger_id: str,
+    session_id: str | None = Query(None, alias="sessionId"),
     db: Session = Depends(get_db),
 ) -> dict:
     prank = _get_prank_by_slug(db, slug)
+    if prank.session_id and session_id and prank.session_id != session_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
     trigger = (
         db.query(PrankTrigger)
         .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
@@ -688,6 +869,56 @@ def delete_prank_trigger_by_slug(
     db.delete(trigger)
     db.commit()
     return {"detail": "Trigger deleted"}
+
+
+@app.post("/api/pranks/{slug}/triggers/{trigger_id}/edit", response_model=PrankTriggerCreateResponse)
+def edit_prank_trigger_image(
+    slug: str,
+    trigger_id: str,
+    session_id: str | None = Form(None, alias="sessionId"),
+    image: UploadFile = File(...),
+    edit_description: str | None = Form(None, alias="edit_description"),
+    db: Session = Depends(get_db),
+) -> PrankTriggerCreateResponse:
+    prank = _get_prank_by_slug(db, slug)
+
+    # Enforce ownership when session_id is provided.
+    if prank.session_id and session_id and prank.session_id != session_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
+    trigger = (
+        db.query(PrankTrigger)
+        .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
+        .first()
+    )
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+
+    payload = image.file.read()
+    ext = ".png"
+    if image.filename and "." in image.filename:
+        ext = "." + image.filename.rsplit(".", 1)[-1].lower()
+
+    image_path, thumb_path = save_prank_image_with_thumbnail(
+        prank.share_slug or prank.slug or "prank",
+        payload,
+        extension=ext,
+    )
+
+    trigger.image_path = image_path
+    trigger.thumbnail_path = thumb_path
+    db.commit()
+    db.refresh(trigger)
+
+    return PrankTriggerCreateResponse(
+        id=str(trigger.id),
+        trigger_text=trigger.trigger_text,
+        image_path=trigger.image_path,
+        thumbnail_path=trigger.thumbnail_path,
+    )
 
 
 @app.get("/api/pranks/{slug}/triggers/{trigger_id}/thumbnail")
@@ -722,7 +953,7 @@ def get_prank_trigger_thumbnail(
 def list_generations(
     limit: int = 50,
     offset: int = 0,
-    session_id: str | None = Query(None),
+    session_id: str | None = Query(None, alias="sessionId"),
     db: Session = Depends(get_db),
 ) -> list[GenerationLogEntry]:
     limit = max(1, min(limit, 200))
@@ -783,3 +1014,21 @@ def get_generation_thumbnail(
         raise HTTPException(status_code=404, detail="Thumbnail file missing")
 
     return FileResponse(thumb_path, media_type=_file_media_type(thumb_path))
+
+
+@app.get("/api/models")
+def list_models_api() -> dict:
+    """
+    Expose model registry for frontend to consume.
+    """
+    models = []
+    for model_id, info in MODEL_REGISTRY.items():
+        models.append(
+            {
+                "id": model_id,
+                "display_name": info.get("display_name", model_id),
+                "tags": info.get("tags", []),
+                "notes": info.get("notes", ""),
+            }
+        )
+    return {"models": models}
