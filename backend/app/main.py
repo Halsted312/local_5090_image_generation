@@ -8,6 +8,7 @@ import os
 import random
 import string
 import threading
+import time
 from typing import Iterable
 
 import torch
@@ -26,15 +27,15 @@ from .flux_models import (
     get_sd3_pipeline,
     get_text_pipeline,
 )
-from .llm_matcher import choose_matching_trigger
 from .models import GenerationLog, Prank, PrankTrigger
-from .prank_matching import match_prank_trigger, PrankMatcherLLM
+from .prank_matching import get_prank_matcher_llm, match_prank_trigger
 from .router_engine import RoutingDecision, route_prompt
 from .schemas import (
     ImageResponse,
     PrankCreateResponse,
     PrankDetailResponse,
     PrankGenerateRequest,
+    MatchedTrigger,
     PrankMetadataCreate,
     PrankTriggerCreateResponse,
     PrankTriggerInfo,
@@ -57,6 +58,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FLUX Image API + Prank Mode")
+
+PRANK_DELAY_MS = int(os.getenv("PRANK_DELAY_MS", "0") or "0")
 
 ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
@@ -84,6 +87,13 @@ def _ensure_tables() -> None:
         Base.metadata.create_all(bind=engine)
         # Global lock to avoid concurrent GPU generations.
         app.state.generation_lock = threading.Lock()
+        # Optional prank-matcher warmup to avoid first-request latency.
+        try:
+            matcher = get_prank_matcher_llm()
+            if matcher is not None:
+                matcher.choose("warmup", ["warmup"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Prank matcher LLM warmup failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to create tables on startup")
         raise
@@ -169,6 +179,12 @@ def _routing_metadata(decision: RoutingDecision) -> RoutingMetadata:
     )
 
 
+def _sleep_prank_delay() -> None:
+    """Artificial delay for prank matches to mimic generation time."""
+    if PRANK_DELAY_MS > 0:
+        time.sleep(PRANK_DELAY_MS / 1000.0)
+
+
 def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.Image, str]:
     """Execute the selected model, branching to the appropriate pipeline."""
     selected = model_id
@@ -249,6 +265,7 @@ def _process_generation(
     share_slug: str | None = None,
     prank_id: str | None = None,
 ) -> ImageResponse:
+    start = time.time()
     if request.engine == "auto":
         decision = route_prompt(request.prompt)
         chosen_model = decision.chosen_model_id
@@ -263,6 +280,7 @@ def _process_generation(
 
     image, actual_model = _execute_model(chosen_model, request)
     image_path, thumb_path = save_generation_image(image)
+    generation_time_ms = int((time.time() - start) * 1000)
 
     generation_id = _log_generation(
         db=db,
@@ -280,10 +298,15 @@ def _process_generation(
         image_base64=_pil_to_base64_png(image),
         generation_id=generation_id,
         model_id=actual_model,
+        model_used=actual_model,
         thumbnail_base64=_encode_thumbnail_base64(thumb_path),
         image_path=image_path,
         thumbnail_path=thumb_path,
         router_metadata=_routing_metadata(decision),
+        was_prank=False,
+        matched_trigger_id=None,
+        matched_trigger_text=None,
+        generation_time_ms=generation_time_ms,
     )
 
 
@@ -375,6 +398,12 @@ def get_prank(slug: str, db: Session = Depends(get_db)) -> PrankDetailResponse:
     )
     payload = _prank_to_response(prank, triggers)
     return PrankDetailResponse(**payload)
+
+
+@app.get("/api/pranks/slug/{slug}", response_model=PrankDetailResponse)
+def get_prank_alias(slug: str, db: Session = Depends(get_db)) -> PrankDetailResponse:
+    """Alias for GET /api/pranks/{slug} to match alternate caller expectations."""
+    return get_prank(slug, db)
 
 
 @app.get("/api/pranks", response_model=list[PrankDetailResponse])
@@ -480,6 +509,7 @@ def generate_prank_image(
         width=request.width,
         height=request.height,
         seed=request.seed,
+        engine=request.engine or "auto",
         session_id=request.session_id,
     )
     if not triggers:
@@ -487,11 +517,15 @@ def generate_prank_image(
 
     trap_texts = [t.trigger_text for t in triggers]
     # Heuristic + optional LLM matcher
-    matcher_model_id = os.getenv("PRANK_MATCHER_LLM_ID", "Qwen/Qwen2.5-1.5B-Instruct")
-    matcher_llm = None
-    if matcher_model_id:
-        matcher_llm = PrankMatcherLLM(matcher_model_id)
+    matcher_llm = get_prank_matcher_llm()
     idx, debug = match_prank_trigger(request.prompt, trap_texts, llm=matcher_llm)
+    start_time = time.time()
+    logger.info(
+        "Prank match debug for slug=%s prompt=%r: %s",
+        slug,
+        request.prompt,
+        debug,
+    )
 
     if idx is not None:
         trigger = triggers[idx]
@@ -510,39 +544,58 @@ def generate_prank_image(
             chosen_model_id="prank",
             scores={"prank": 1.0},
             tags=["prank"],
-            reason=f"Matched prank trigger {trigger.id}",
+            reason=f"Matched prank trigger: {trigger.trigger_text}",
         )
         generation_id = _log_generation(
             db=db,
             prompt=request.prompt,
             model_id="prank",
             router_decision=decision,
-            image_path=image_path,
-            thumbnail_path=thumb_path,
-            prank_id=str(prank.id),
-            share_slug=prank.share_slug,
-            session_id=request.session_id,
-        )
+        image_path=image_path,
+        thumbnail_path=thumb_path,
+        prank_id=str(prank.id),
+        share_slug=prank.share_slug,
+        session_id=request.session_id,
+    )
 
-        # Optional delay to mimic generation time when serving a stored prank.
-        try:
-            import time as _time  # local import to avoid global namespace noise
-
-            _time.sleep(3)
-        except Exception:
-            pass
+        # Artificial delay to mimic generation time for prank hits.
+        _sleep_prank_delay()
+        total_ms = int((time.time() - start_time) * 1000)
 
         return ImageResponse(
             image_base64=load_prank_image_base64(trigger.image_path),
             generation_id=generation_id,
             model_id="prank",
+            model_used="prank",
             thumbnail_base64=_encode_thumbnail_base64(thumb_path),
             image_path=image_path,
             thumbnail_path=thumb_path,
             router_metadata=_routing_metadata(decision),
+            was_prank=True,
+            matched_trigger_id=str(trigger.id),
+            matched_trigger_text=trigger.trigger_text,
+            generation_time_ms=total_ms,
+            is_prank_match=True,
+            matched_trigger=MatchedTrigger(
+                id=str(trigger.id),
+                trigger_text=trigger.trigger_text,
+                image_base64=load_prank_image_base64(trigger.image_path),
+                thumbnail_base64=_encode_thumbnail_base64(trigger.thumbnail_path)
+                if trigger.thumbnail_path
+                else None,
+            ),
         )
 
-    return _process_generation(text_request, db, share_slug=prank.share_slug)
+    resp = _process_generation(text_request, db, share_slug=prank.share_slug)
+    # Explicitly mark as non-prank when no trigger matched.
+    resp.is_prank_match = False
+    resp.matched_trigger = None
+    resp.matched_trigger_id = None
+    resp.matched_trigger_text = None
+    resp.was_prank = False
+    if resp.model_id and not resp.model_used:
+        resp.model_used = resp.model_id
+    return resp
 
 
 @app.patch("/api/pranks/{prank_id}/triggers/{trigger_id}", response_model=PrankTriggerCreateResponse)

@@ -23,9 +23,19 @@ class TextGenerateRequest(BaseModel):
 class RoutingMetadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     chosen_model_id: str
-    scores: dict[str, float] | None = None
-    tags: list[str] | None = None
-    reason: str | None = None
+    scores: dict[str, float] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class MatchedTrigger(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: str
+    trigger_text: str = Field(..., alias="trigger_text", serialization_alias="triggerText")
+    image_base64: str = Field(..., alias="image_base64", serialization_alias="imageBase64")
+    thumbnail_base64: str | None = Field(
+        None, alias="thumbnail_base64", serialization_alias="thumbnailBase64"
+    )
 
 
 class ImageResponse(BaseModel):
@@ -33,10 +43,19 @@ class ImageResponse(BaseModel):
     image_base64: str
     generation_id: str | None = None
     model_id: str | None = None
+    model_used: str | None = None
+    was_prank: bool | None = None
+    matched_trigger_id: str | None = Field(None, alias="matched_trigger_id", serialization_alias="matched_trigger_id")
+    matched_trigger_text: str | None = Field(
+        None, alias="matched_trigger_text", serialization_alias="matched_triggerText"
+    )
+    generation_time_ms: int | None = None
     thumbnail_base64: str | None = None
     image_path: str | None = None
     thumbnail_path: str | None = None
     router_metadata: RoutingMetadata | None = None
+    is_prank_match: bool | None = None
+    matched_trigger: MatchedTrigger | None = None
 
 
 class PrankMetadataCreate(BaseModel):
@@ -81,6 +100,9 @@ class PrankGenerateRequest(BaseModel):
     height: int | None = Field(None, ge=256, le=2048)
     seed: int | None = Field(None, description="Optional RNG seed for prank generation")
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
+    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "logo_sdxl"] | None = Field(
+        None, alias="engine", description="Engine override; defaults to auto"
+    )
 
 class PrankTriggerUpdateRequest(BaseModel):
     trigger_text: str = Field(..., description="Updated trigger text")
