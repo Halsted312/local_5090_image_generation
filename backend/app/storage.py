@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+from io import BytesIO
 import uuid
 from pathlib import Path
 from typing import Tuple
@@ -20,6 +21,11 @@ GEN_THUMB_ROOT = Path(os.getenv("GEN_THUMB_ROOT", BASE_DIR / "data" / "images" /
 GEN_IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
 GEN_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
 
+MAX_IMAGE_DIM = 2000
+MAX_IMAGE_BYTES = 3 * 1024 * 1024  # 3MB
+JPEG_QUALITY_START = 90
+JPEG_QUALITY_MIN = 70
+
 
 def _slug_folder(slug: str) -> Path:
     safe_slug = slug.replace("/", "_")
@@ -28,16 +34,48 @@ def _slug_folder(slug: str) -> Path:
     return folder
 
 
+def _normalize_image(image: Image.Image) -> Image.Image:
+    """
+    Convert to RGB and clamp longest side to MAX_IMAGE_DIM, preserving aspect.
+    """
+    img = image.convert("RGB")
+    max_dim = max(img.size)
+    if max_dim > MAX_IMAGE_DIM:
+        img = img.copy()
+        img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM))
+    return img
+
+
+def _save_jpeg_with_limit(image: Image.Image, path: Path, quality: int = JPEG_QUALITY_START) -> int:
+    """
+    Save image as JPEG, reducing quality in steps until under MAX_IMAGE_BYTES or reaching min quality.
+    Returns the number of bytes written.
+    """
+    q = quality
+    while True:
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=q)
+        data = buffer.getvalue()
+        if len(data) <= MAX_IMAGE_BYTES or q <= JPEG_QUALITY_MIN:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            return len(data)
+        q = max(JPEG_QUALITY_MIN, q - 10)
+
+
 def save_prank_image(slug: str, payload: bytes, extension: str = ".png") -> str:
     """
-    Save prank image bytes under ./prank_images/<slug>/<uuid>.ext and return the absolute path.
+    Save prank image bytes under ./prank_images/<slug>/<uuid>.jpg and return the absolute path.
     """
     folder = _slug_folder(slug)
-    filename = f"{uuid.uuid4().hex}{extension}"
-    path = folder / filename
-    with open(path, "wb") as f:
-        f.write(payload)
-    return str(path.resolve())
+    filename = f"{uuid.uuid4().hex}.jpg"
+    path = (folder / filename).resolve()
+
+    with Image.open(BytesIO(payload)) as img:
+        normalized = _normalize_image(img)
+        _save_jpeg_with_limit(normalized, path, quality=JPEG_QUALITY_START)
+    return str(path)
 
 
 def resolve_image_path(slug: str, relative_path: str) -> Path:
@@ -62,18 +100,17 @@ def save_prank_image_with_thumbnail(slug: str, payload: bytes, extension: str = 
     Save prank image and a 256px thumbnail. Returns (image_path, thumb_path).
     """
     folder = _slug_folder(slug)
-    filename = f"{uuid.uuid4().hex}{extension}"
+    filename = f"{uuid.uuid4().hex}.jpg"
     path = (folder / filename).resolve()
     thumb_path = (folder / f"{filename}_thumb.jpg").resolve()
 
-    with open(path, "wb") as f:
-        f.write(payload)
+    with Image.open(BytesIO(payload)) as img:
+        normalized = _normalize_image(img)
+        _save_jpeg_with_limit(normalized, path, quality=JPEG_QUALITY_START)
 
-    # build thumbnail
-    with Image.open(path) as img:
-        thumb = img.convert("RGB")
+        thumb = normalized.copy()
         thumb.thumbnail((256, 256))
-        thumb.save(thumb_path, format="JPEG", quality=80)
+        _save_jpeg_with_limit(thumb, thumb_path, quality=80)
 
     return str(path), str(thumb_path)
 
@@ -86,16 +123,17 @@ def save_generation_image(image: Image.Image) -> Tuple[str, str]:
         (image_path, thumbnail_path) absolute paths.
     """
     image_id = uuid.uuid4().hex
-    img_path = (GEN_IMAGE_ROOT / f"{image_id}.png").resolve()
+    img_path = (GEN_IMAGE_ROOT / f"{image_id}.jpg").resolve()
     thumb_path = (GEN_THUMB_ROOT / f"{image_id}_thumb.jpg").resolve()
 
     img_path.parent.mkdir(parents=True, exist_ok=True)
     thumb_path.parent.mkdir(parents=True, exist_ok=True)
 
-    image.save(img_path, format="PNG")
+    normalized = _normalize_image(image)
+    _save_jpeg_with_limit(normalized, img_path, quality=JPEG_QUALITY_START)
 
-    thumb = image.copy()
+    thumb = normalized.copy()
     thumb.thumbnail((256, 256))
-    thumb.save(thumb_path, format="JPEG", quality=80)
+    _save_jpeg_with_limit(thumb, thumb_path, quality=80)
 
     return str(img_path), str(thumb_path)
