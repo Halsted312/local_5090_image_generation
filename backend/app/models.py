@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -53,6 +53,10 @@ class GenerationLog(Base):
     """
 
     __tablename__ = "generation_logs"
+    __table_args__ = (
+        Index("idx_generation_session", "session_id"),
+        Index("idx_generation_created", "created_at"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     prompt = Column(Text, nullable=False)

@@ -11,10 +11,12 @@ import threading
 from typing import Iterable
 
 import torch
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi import File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PIL import Image
+from pathlib import Path
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
@@ -26,6 +28,7 @@ from .flux_models import (
 )
 from .llm_matcher import choose_matching_trigger
 from .models import GenerationLog, Prank, PrankTrigger
+from .prank_matching import match_prank_trigger, PrankMatcherLLM
 from .router_engine import RoutingDecision, route_prompt
 from .schemas import (
     ImageResponse,
@@ -374,43 +377,32 @@ def get_prank(slug: str, db: Session = Depends(get_db)) -> PrankDetailResponse:
     return PrankDetailResponse(**payload)
 
 
-@app.post("/api/pranks/{prank_id}/triggers", response_model=PrankTriggerCreateResponse)
-def add_prank_trigger(
-    prank_id: str,
-    trigger_text: str = Form(...),
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-) -> PrankTriggerCreateResponse:
-    prank = db.query(Prank).filter(Prank.id == prank_id).first()
-    if prank is None:
-        raise HTTPException(status_code=404, detail="Prank not found")
+@app.get("/api/pranks", response_model=list[PrankDetailResponse])
+def list_pranks(session_id: str | None = Query(None), db: Session = Depends(get_db)) -> list[PrankDetailResponse]:
+    """
+    List prank sets owned by the provided session_id. Returns [] when session_id is missing.
+    """
+    if not session_id:
+        return []
 
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
-
-    payload = file.file.read()
-    ext = ".png"
-    if file.filename and "." in file.filename:
-        ext = "." + file.filename.rsplit(".", 1)[-1].lower()
-
-    image_path, thumb_path = save_prank_image_with_thumbnail(prank.slug, payload, extension=ext)
-
-    trigger = PrankTrigger(
-        prank_id=prank.id,
-        trigger_text=trigger_text,
-        image_path=image_path,
-        thumbnail_path=thumb_path,
+    pranks = (
+        db.query(Prank)
+        .filter(Prank.session_id == session_id)
+        .order_by(Prank.created_at.desc())
+        .all()
     )
-    db.add(trigger)
-    db.commit()
-    db.refresh(trigger)
 
-    return PrankTriggerCreateResponse(
-        id=str(trigger.id),
-        trigger_text=trigger.trigger_text,
-        image_path=trigger.image_path,
-        thumbnail_path=trigger.thumbnail_path,
-    )
+    results: list[PrankDetailResponse] = []
+    for prank in pranks:
+        triggers = (
+            db.query(PrankTrigger)
+            .filter(PrankTrigger.prank_id == prank.id)
+            .order_by(PrankTrigger.created_at.asc())
+            .all()
+        )
+        payload = _prank_to_response(prank, triggers)
+        results.append(PrankDetailResponse(**payload))
+    return results
 
 
 def _add_prank_trigger(
@@ -427,7 +419,10 @@ def _add_prank_trigger(
     if file.filename and "." in file.filename:
         ext = "." + file.filename.rsplit(".", 1)[-1].lower()
 
-    image_path, thumb_path = save_prank_image_with_thumbnail(prank.slug, payload, extension=ext)
+    # Use share_slug for storage folder consistency
+    image_path, thumb_path = save_prank_image_with_thumbnail(
+        prank.share_slug or prank.slug or "prank", payload, extension=ext
+    )
 
     trigger = PrankTrigger(
         prank_id=prank.id,
@@ -447,14 +442,22 @@ def _add_prank_trigger(
     )
 
 
-@app.post("/api/pranks/slug/{slug}/triggers", response_model=PrankTriggerCreateResponse)
+@app.post("/api/pranks/{slug}/triggers", response_model=PrankTriggerCreateResponse)
 def add_prank_trigger_by_slug(
     slug: str,
-    trigger_text: str = Form(...),
+    session_id: str | None = Form(None, alias="sessionId"),
+    trigger_text: str = Form(..., alias="triggerText"),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> PrankTriggerCreateResponse:
-    prank = _get_prank_by_slug(db, slug)
+    prank = db.query(Prank).filter(
+        (Prank.share_slug == slug) | (Prank.builder_slug == slug) | (Prank.slug == slug)
+    ).first()
+    if prank is None:
+        raise HTTPException(status_code=404, detail="Prank not found.")
+    # Enforce ownership when session_id is provided
+    if prank.session_id and session_id and prank.session_id != session_id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
     return _add_prank_trigger(prank, trigger_text, file, db)
 
 
@@ -483,7 +486,12 @@ def generate_prank_image(
         return _process_generation(text_request, db, share_slug=prank.share_slug)
 
     trap_texts = [t.trigger_text for t in triggers]
-    idx = choose_matching_trigger(request.prompt, trap_texts)
+    # Heuristic + optional LLM matcher
+    matcher_model_id = os.getenv("PRANK_MATCHER_LLM_ID", "Qwen/Qwen2.5-1.5B-Instruct")
+    matcher_llm = None
+    if matcher_model_id:
+        matcher_llm = PrankMatcherLLM(matcher_model_id)
+    idx, debug = match_prank_trigger(request.prompt, trap_texts, llm=matcher_llm)
 
     if idx is not None:
         trigger = triggers[idx]
@@ -629,16 +637,51 @@ def delete_prank_trigger_by_slug(
     return {"detail": "Trigger deleted"}
 
 
+@app.get("/api/pranks/{slug}/triggers/{trigger_id}/thumbnail")
+def get_prank_trigger_thumbnail(
+    slug: str,
+    trigger_id: str,
+    db: Session = Depends(get_db),
+):
+    prank = _get_prank_by_slug(db, slug)
+    trigger = (
+        db.query(PrankTrigger)
+        .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
+        .first()
+    )
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    thumb_path = trigger.thumbnail_path or trigger.image_path
+    if not thumb_path:
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+
+    path = Path(thumb_path)
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail file missing")
+
+    return FileResponse(path, media_type=_file_media_type(path))
+
+
 @app.get("/api/generations", response_model=list[GenerationLogEntry])
 def list_generations(
     limit: int = 50,
     offset: int = 0,
+    session_id: str | None = Query(None),
     db: Session = Depends(get_db),
 ) -> list[GenerationLogEntry]:
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
+
+    # Privacy: require session_id to filter; otherwise return empty list.
+    if not session_id:
+        return []
+
     rows = (
         db.query(GenerationLog)
+        .filter(GenerationLog.session_id == session_id)
         .order_by(GenerationLog.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -658,3 +701,32 @@ def list_generations(
         )
         for r in rows
     ]
+
+
+def _file_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
+
+
+@app.get("/api/images/thumb/{generation_id}")
+def get_generation_thumbnail(
+    generation_id: str,
+    db: Session = Depends(get_db),
+):
+    gen = db.query(GenerationLog).filter(GenerationLog.id == generation_id).first()
+    if not gen or not gen.thumbnail_path:
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+
+    thumb_path = Path(gen.thumbnail_path)
+    if not thumb_path.is_absolute():
+        thumb_path = (Path(gen.thumbnail_path)).resolve()
+    if not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail file missing")
+
+    return FileResponse(thumb_path, media_type=_file_media_type(thumb_path))

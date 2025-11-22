@@ -67,9 +67,9 @@ class PrankTriggerCreateRequest(BaseModel):
 class PrankTriggerCreateResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: str
-    trigger_text: str
-    image_path: str
-    thumbnail_path: str | None = None
+    trigger_text: str = Field(..., alias="triggerText")
+    image_path: str = Field(..., alias="imagePath")
+    thumbnail_path: str | None = Field(None, alias="thumbnailPath")
 
 
 class PrankGenerateRequest(BaseModel):
