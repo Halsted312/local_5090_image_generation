@@ -83,9 +83,7 @@ ALLOWED_ORIGINS: Iterable[str] = (
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),
-    # Allow dynamic Replit preview domains
-    allow_origin_regex=r"https://.*\.replit\.app",
+    allow_origins=list(ALLOWED_ORIGINS),  # Only explicit origins, no wildcards
     allow_credentials=False,  # frontend sends credentials: 'omit'
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -98,6 +96,15 @@ SLUG_ALPHABET = string.ascii_letters + string.digits
 def _ensure_tables() -> None:
     """Create tables on startup for local/dev usage."""
     try:
+        # Clear CUDA cache on startup for clean memory state
+        if torch.cuda.is_available():
+            logger.info("Clearing CUDA cache on startup...")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU Memory: {free_mem:.2f} GB free / {total_mem:.2f} GB total")
+
         Base.metadata.create_all(bind=engine)
         # Global lock to avoid concurrent GPU generations.
         app.state.generation_lock = threading.Lock()
@@ -122,7 +129,11 @@ def _pil_to_base64_png(image: Image.Image) -> str:
 def _make_generator(device: torch.device | str, seed: int | None) -> torch.Generator | None:
     if seed is None:
         return None
-    return torch.Generator(device=str(device)).manual_seed(seed)
+    # Handle "meta" device case when using device_map="balanced"
+    device_str = str(device)
+    if device_str == "meta":
+        device_str = "cpu"
+    return torch.Generator(device=device_str).manual_seed(seed)
 
 
 def _free_cuda_memory() -> None:
@@ -136,8 +147,16 @@ def _free_cuda_memory() -> None:
 
 
 def _generate_unique_slug(db: Session, length: int = 5) -> str:
+    """Generate a unique slug, avoiding reserved slugs like 'imagine'."""
+    RESERVED_SLUGS = {"imagine"}  # Reserved for VIP pranks
+
     while True:
         candidate = "".join(random.choices(SLUG_ALPHABET, k=length))
+
+        # Skip reserved slugs
+        if candidate.lower() in RESERVED_SLUGS:
+            continue
+
         existing = (
             db.query(Prank)
             .filter(
@@ -276,14 +295,29 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
         pipe = get_text_pipeline()
         selected = "flux_dev"
 
+    # Use HiDream-specific defaults when logo_sdxl is selected
+    if model_id == "logo_sdxl":
+        from .config import HIDREAM_STEPS, HIDREAM_GUIDANCE
+        num_steps = request.num_inference_steps or HIDREAM_STEPS
+        guidance = request.guidance_scale if request.guidance_scale is not None else HIDREAM_GUIDANCE
+    else:
+        num_steps = request.num_inference_steps
+        guidance = request.guidance_scale
+
+    # Get device, handling special cases for CPU offload models
     device = getattr(pipe, "device", "cpu")
-    generator = _make_generator(device, request.seed)
+    # When using device_map or CPU offload, device might be "meta" - use "cpu" for generator
+    if str(device) == "meta":
+        generator_device = "cpu"
+    else:
+        generator_device = device
+    generator = _make_generator(generator_device, request.seed)
     with generation_lock:
         try:
             result = pipe(
                 prompt=request.prompt,
-                num_inference_steps=request.num_inference_steps,
-                guidance_scale=request.guidance_scale,
+                num_inference_steps=num_steps,
+                guidance_scale=guidance,
                 width=request.width,
                 height=request.height,
                 generator=generator,
@@ -407,6 +441,45 @@ def admin_verify(_: None = Depends(require_admin)) -> dict:
     return {"status": "ok"}
 
 
+@app.post("/api/admin/pranks/vip", response_model=PrankCreateResponse)
+def get_or_create_vip_prank(
+    _: None = Depends(require_admin),
+    db: Session = Depends(get_db)
+) -> PrankCreateResponse:
+    """
+    Idempotent endpoint that ensures the VIP 'imagine' prank exists and returns its details.
+    Only admin can call this endpoint.
+    """
+    # Check if the VIP prank already exists
+    existing_prank = db.query(Prank).filter(Prank.share_slug == "imagine").first()
+
+    if existing_prank:
+        # Return existing VIP prank
+        triggers = list(existing_prank.triggers)
+        payload = _prank_to_response(existing_prank, triggers)
+        return PrankCreateResponse(**payload)
+
+    # Create the VIP prank
+    builder_slug = _generate_unique_slug(db, length=8)
+    vip_prank = Prank(
+        share_slug="imagine",
+        builder_slug=builder_slug,
+        slug="imagine",  # legacy compatibility
+        title="CEO VIP Prank Page",
+        session_id=None,  # No session owner, admin-only
+        is_vip=True,
+        is_admin_only=True,
+        view_count=0
+    )
+
+    db.add(vip_prank)
+    db.commit()
+    db.refresh(vip_prank)
+
+    payload = _prank_to_response(vip_prank, [])
+    return PrankCreateResponse(**payload)
+
+
 @app.options("/api/generate")
 async def generate_options() -> Response:
     """Explicit preflight handler; CORSMiddleware adds headers."""
@@ -425,16 +498,25 @@ def _prank_to_response(prank: Prank, triggers: list[PrankTrigger]) -> dict:
     base_url = os.getenv("FRONTEND_BASE_URL", "https://promptpics.ai")
     share_slug = prank.share_slug
     builder_slug = prank.builder_slug
+
+    # Special URL for VIP prank
+    if share_slug == "imagine":
+        share_url = f"{base_url}/imagine"
+    else:
+        share_url = f"{base_url}/p/{share_slug}"
+
     return {
         "id": str(prank.id),
-        "slug": share_slug,
+        "slug": share_slug,  # legacy field
+        "shareSlug": share_slug,  # explicit shareSlug field
         "builderSlug": builder_slug,
         "title": prank.title,
         "sessionId": prank.session_id,
-        "shareUrl": f"{base_url}/p/{share_slug}",
+        "shareUrl": share_url,
         "builderUrl": f"{base_url}/customize/{builder_slug}",
         "createdAt": prank.created_at.isoformat() if prank.created_at else None,
         "viewCount": prank.view_count or 0,
+        "isVip": prank.is_vip if hasattr(prank, 'is_vip') else False,
         "triggers": [
             {
                 "id": str(t.id),
@@ -453,17 +535,26 @@ def _prank_to_summary(prank: Prank, trigger_count: int) -> dict:
     base_url = os.getenv("FRONTEND_BASE_URL", "https://promptpics.ai")
     share_slug = prank.share_slug
     builder_slug = prank.builder_slug
+
+    # Special URL for VIP prank
+    if share_slug == "imagine":
+        share_url = f"{base_url}/imagine"
+    else:
+        share_url = f"{base_url}/p/{share_slug}"
+
     return {
         "id": str(prank.id),
-        "slug": share_slug,
+        "slug": share_slug,  # legacy field
+        "shareSlug": share_slug,  # explicit shareSlug field
         "builderSlug": builder_slug,
         "title": prank.title,
         "sessionId": prank.session_id,
-        "shareUrl": f"{base_url}/p/{share_slug}",
+        "shareUrl": share_url,
         "builderUrl": f"{base_url}/customize/{builder_slug}",
         "createdAt": prank.created_at.isoformat() if prank.created_at else None,
         "viewCount": prank.view_count or 0,
         "triggerCount": trigger_count,
+        "isVip": prank.is_vip if hasattr(prank, 'is_vip') else False,
     }
 
 
@@ -652,6 +743,7 @@ def add_prank_trigger_by_slug(
     session_id: str | None = Form(None, alias="sessionId"),
     trigger_text: str = Form(..., alias="triggerText"),
     file: UploadFile = File(...),
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
     db: Session = Depends(get_db),
 ) -> PrankTriggerCreateResponse:
     prank = db.query(Prank).filter(
@@ -659,9 +751,19 @@ def add_prank_trigger_by_slug(
     ).first()
     if prank is None:
         raise HTTPException(status_code=404, detail="Prank not found.")
-    # Enforce ownership when session_id is provided
-    if prank.session_id and session_id and prank.session_id != session_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
+    # Check if prank is admin-only
+    if hasattr(prank, 'is_admin_only') and prank.is_admin_only:
+        # Admin-only pranks require valid admin token
+        if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+            raise HTTPException(status_code=403, detail="Admin access required for this prank.")
+        if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
+            raise HTTPException(status_code=401, detail="Admin token expired; please login again")
+    else:
+        # Regular prank: enforce ownership when session_id is provided
+        if prank.session_id and session_id and prank.session_id != session_id:
+            raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
     return _add_prank_trigger(prank, trigger_text, file, db)
 
 
@@ -805,11 +907,23 @@ def update_prank_trigger_by_slug(
     trigger_id: str,
     payload: PrankTriggerUpdateRequest,
     session_id: str | None = Query(None, alias="sessionId"),
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
     db: Session = Depends(get_db),
 ) -> PrankTriggerCreateResponse:
     prank = _get_prank_by_slug(db, slug)
-    if prank.session_id and session_id and prank.session_id != session_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
+    # Check if prank is admin-only
+    if hasattr(prank, 'is_admin_only') and prank.is_admin_only:
+        # Admin-only pranks require valid admin token
+        if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+            raise HTTPException(status_code=403, detail="Admin access required for this prank.")
+        if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
+            raise HTTPException(status_code=401, detail="Admin token expired; please login again")
+    else:
+        # Regular prank: enforce ownership when session_id is provided
+        if prank.session_id and session_id and prank.session_id != session_id:
+            raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
     trigger = (
         db.query(PrankTrigger)
         .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
@@ -853,11 +967,23 @@ def delete_prank_trigger_by_slug(
     slug: str,
     trigger_id: str,
     session_id: str | None = Query(None, alias="sessionId"),
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
     db: Session = Depends(get_db),
 ) -> dict:
     prank = _get_prank_by_slug(db, slug)
-    if prank.session_id and session_id and prank.session_id != session_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
+    # Check if prank is admin-only
+    if hasattr(prank, 'is_admin_only') and prank.is_admin_only:
+        # Admin-only pranks require valid admin token
+        if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+            raise HTTPException(status_code=403, detail="Admin access required for this prank.")
+        if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
+            raise HTTPException(status_code=401, detail="Admin token expired; please login again")
+    else:
+        # Regular prank: enforce ownership when session_id is provided
+        if prank.session_id and session_id and prank.session_id != session_id:
+            raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+
     trigger = (
         db.query(PrankTrigger)
         .filter(PrankTrigger.id == trigger_id, PrankTrigger.prank_id == prank.id)
@@ -878,13 +1004,22 @@ def edit_prank_trigger_image(
     session_id: str | None = Form(None, alias="sessionId"),
     image: UploadFile = File(...),
     edit_description: str | None = Form(None, alias="edit_description"),
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
     db: Session = Depends(get_db),
 ) -> PrankTriggerCreateResponse:
     prank = _get_prank_by_slug(db, slug)
 
-    # Enforce ownership when session_id is provided.
-    if prank.session_id and session_id and prank.session_id != session_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
+    # Check if prank is admin-only
+    if hasattr(prank, 'is_admin_only') and prank.is_admin_only:
+        # Admin-only pranks require valid admin token
+        if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+            raise HTTPException(status_code=403, detail="Admin access required for this prank.")
+        if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
+            raise HTTPException(status_code=401, detail="Admin token expired; please login again")
+    else:
+        # Regular prank: enforce ownership when session_id is provided
+        if prank.session_id and session_id and prank.session_id != session_id:
+            raise HTTPException(status_code=403, detail="Not authorized to modify this prank.")
 
     trigger = (
         db.query(PrankTrigger)

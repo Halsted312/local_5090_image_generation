@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
 pydantic
-diffusers
-transformers
+diffusers>=0.31.0
+transformers>=4.44.0
 accelerate
 safetensors
 sentencepiece
@@ -12,3 +12,4 @@ protobuf
 hf-transfer
 sqlalchemy
 psycopg2-binary
+torch>=2.0.0

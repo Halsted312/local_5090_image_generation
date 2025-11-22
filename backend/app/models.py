@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, Index
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -23,6 +23,8 @@ class Prank(Base):
     title = Column(Text, nullable=True)
     session_id = Column(String(100), nullable=True)
     view_count = Column(Integer, default=0)
+    is_vip = Column(Boolean, default=False, nullable=False)  # VIP pranks (like "imagine") get special treatment
+    is_admin_only = Column(Boolean, default=False, nullable=False)  # Only admin can edit this prank
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     triggers = relationship(

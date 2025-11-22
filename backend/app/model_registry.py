@@ -21,9 +21,9 @@ MODEL_REGISTRY: Dict[str, Dict[str, object]] = {
         "notes": "Complex scenes, posters, UI, better typography.",
     },
     "logo_sdxl": {
-        "display_name": "SDXL Base (Logo/Text)",
-        "tags": ["logo", "icon", "text"],
-        "notes": "Logos/icons/flat text-centric designs.",
+        "display_name": "HiDream I1 (Text & Logos)",
+        "tags": ["logo", "icon", "text", "prompt-following"],
+        "notes": "17B HiDream-I1-Full, superior text rendering and logo generation.",
     },
 }
 

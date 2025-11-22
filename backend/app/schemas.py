@@ -66,7 +66,8 @@ class PrankMetadataCreate(BaseModel):
 class PrankCreateResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
-    slug: str  # share slug
+    slug: str  # share slug (legacy field for backward compatibility)
+    share_slug: str = Field(..., alias="shareSlug")  # Explicit shareSlug field
     builder_slug: str = Field(..., alias="builderSlug")
     title: str | None
     session_id: str | None = Field(None, alias="sessionId")
@@ -74,6 +75,7 @@ class PrankCreateResponse(BaseModel):
     builder_url: str = Field(..., alias="builderUrl")
     created_at: str = Field(..., alias="createdAt")
     view_count: int = Field(..., alias="viewCount")
+    is_vip: bool = Field(False, alias="isVip")
     triggers: list["PrankTriggerInfo"] = []
 
 class PrankTriggerCreateRequest(BaseModel):
@@ -121,7 +123,8 @@ class PrankTriggerInfo(BaseModel):
 class PrankDetailResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
-    slug: str
+    slug: str  # legacy field for backward compatibility
+    share_slug: str = Field(..., alias="shareSlug")  # Explicit shareSlug field
     builder_slug: str = Field(..., alias="builderSlug")
     title: str | None
     session_id: str | None = Field(None, alias="sessionId")
@@ -129,13 +132,15 @@ class PrankDetailResponse(BaseModel):
     builder_url: str = Field(..., alias="builderUrl")
     created_at: str = Field(..., alias="createdAt")
     view_count: int = Field(..., alias="viewCount")
+    is_vip: bool = Field(False, alias="isVip")
     triggers: list[PrankTriggerInfo]
 
 
 class PrankSummary(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
     id: str
-    slug: str
+    slug: str  # legacy field for backward compatibility
+    share_slug: str = Field(..., alias="shareSlug")  # Explicit shareSlug field
     builder_slug: str = Field(..., alias="builderSlug")
     title: str | None
     session_id: str | None = Field(None, alias="sessionId")
@@ -144,6 +149,7 @@ class PrankSummary(BaseModel):
     created_at: str = Field(..., alias="createdAt")
     view_count: int = Field(..., alias="viewCount")
     trigger_count: int = Field(..., alias="triggerCount")
+    is_vip: bool = Field(False, alias="isVip")
 
 
 class AdminLoginRequest(BaseModel):
