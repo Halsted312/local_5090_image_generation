@@ -41,19 +41,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FLUX Image API + Prank Mode")
 
-_env_origins = os.getenv("CORS_ALLOW_ORIGINS")
-if _env_origins:
-    ALLOWED_ORIGINS: Iterable[str] = tuple(o.strip() for o in _env_origins.split(",") if o.strip())
-else:
-    ALLOWED_ORIGINS: Iterable[str] = (
-        "http://localhost:7080",
-        "http://127.0.0.1:7080",
-        "http://localhost:6970",
-        "http://127.0.0.1:6970",
-        "http://localhost",
-        "http://127.0.0.1",
-        "https://app.promptpics.ai",
-    )
+ALLOWED_ORIGINS: Iterable[str] = (
+    "https://promptpics.ai",
+    "https://*.replit.app",
+    "http://localhost:3000",
+    "https://app.promptpics.ai",
+)
 
 app.add_middleware(
     CORSMiddleware,
