@@ -1,0 +1,18 @@
+[Unit]
+Description=PromptPics stack (Docker compose + ngrok)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/halsted/Python/flexy-face
+Environment=NGROK_CONFIG=/home/halsted/.config/ngrok/ngrok.yml
+ExecStart=/usr/bin/docker compose up -d db backend
+ExecStartPost=/home/halsted/Python/flexy-face/scripts/start_ngrok_promptpics.sh
+ExecStop=/usr/bin/docker compose down
+RemainAfterExit=yes
+Restart=on-failure
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

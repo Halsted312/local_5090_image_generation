@@ -10,8 +10,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Default model ID; can be overridden via environment variables.
+# Default model IDs; can be overridden via environment variables.
 FLUX_TEXT_MODEL_ID: str = os.getenv("FLUX_TEXT_MODEL_ID", "black-forest-labs/FLUX.1-schnell")
+REALVIS_MODEL_ID: str = os.getenv("REALVIS_MODEL_ID", "SG161222/RealVisXL_V4.0")
+SD3_MODEL_ID: str = os.getenv("SD3_MODEL_ID", "stabilityai/stable-diffusion-3-medium-diffusers")
+LOGO_SDXL_MODEL_ID: str = os.getenv("LOGO_SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
 DeviceType = Literal["cuda", "cpu"]
 

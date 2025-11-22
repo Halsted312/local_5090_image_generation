@@ -27,7 +27,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 7999
+# listen on all interfaces so ngrok can reach it
+uvicorn app.main:app --reload --host 0.0.0.0 --port 7999
 ```
 
 ## Flow
@@ -41,12 +42,13 @@ See `docs/AGENT_INSTRUCTIONS.md` for the original build brief.
 
 ## Current architecture (API-only)
 - Backend (FastAPI) on port 7999, exposed via ngrok at `https://app.promptpics.ai`.
-- CORS allows: `https://promptpics.ai`, `https://*.replit.app`, `http://localhost:3000`, `https://app.promptpics.ai`.
+- CORS: currently `*` for development; tighten to explicit origins when your Replit domain is final.
 - Frontend is now hosted elsewhere (Replit). The archived local UI lives in `frontend_archive_ignore/` (docker-compose still builds it for dev if needed).
 
 ## Ngrok
 - Config: `~/.config/ngrok/ngrok.yml` with endpoint `promptpics` → upstream `7999`.
 - Start manually: `./scripts/start_ngrok_promptpics.sh`
+- One-off tunnel (no config): `ngrok http 7999 --host-header="localhost:7999"`
 - Docs: `docs/ngrok-promptpics.md`
 
 ## Systemd (optional, not installed by default)

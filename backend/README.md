@@ -30,9 +30,10 @@ uvicorn app.main:app --reload --port 7999
 ## Endpoints
 
 - `GET /health` – health check.
-- `POST /api/generate` – JSON body (`TextGenerateRequest`) for text-to-image. Returns `{ "image_base64": "..." }`.
+- `POST /api/generate` – JSON body (`TextGenerateRequest`) for text-to-image. Uses heuristic + LLM routing across model ids and returns base64 plus metadata (generation_id, model_id, thumbnail, paths, router_metadata).
 - `POST /api/pranks` – create a prank slug.
 - `POST /api/pranks/{prank_id}/triggers` – attach stored prank images to triggers (operator-only, references local files).
 - `POST /api/p/{slug}/generate` – prank endpoint that returns a stored image on a trap match; otherwise falls back to FLUX.
+- `GET /api/generations` – list recent generation logs with image/thumbnail paths and router JSON.
 
 Pipeline defaults target CUDA; CPU is used as a fallback, but performance will degrade.
