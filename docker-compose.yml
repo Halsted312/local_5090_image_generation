@@ -20,10 +20,12 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://flexyface:flexypass@db:5432/flexyface}
       - PRANK_IMAGE_ROOT=/data/prank_images
       - PRANK_LLM_ID=${PRANK_LLM_ID:-meta-llama/Meta-Llama-3-8B-Instruct}
-      - ADMIN_PASSWORD=Halsted312Fwed11-11
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
+      - GPU_COORD_PATH=/gpu_coord/status.json
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./prank_images:/data/prank_images
+      - gpu-coord:/gpu_coord
     ports:
       - "7999:7999"
     depends_on:
@@ -43,6 +45,31 @@ services:
     depends_on:
       - backend
 
+  benchmark:
+    build:
+      context: .
+      dockerfile: research/Dockerfile.benchmark
+    env_file:
+      - .env
+    environment:
+      - GPU_COORD_PATH=/gpu_coord/status.json
+      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN:-}
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    volumes:
+      - gpu-coord:/gpu_coord
+      - hf_cache:/root/.cache/huggingface
+      - ./research:/workspace/research:ro
+      - ./research/benchmark_results:/workspace/benchmark_results
+    command: ["python", "research/docs/efficient_benchmark_runner.py"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   hf_cache:
   db_data:
+  gpu-coord:

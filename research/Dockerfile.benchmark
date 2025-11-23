@@ -1,0 +1,12 @@
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+WORKDIR /workspace
+
+COPY research/requirements.txt /workspace/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/requirements.txt
+
+COPY . /workspace
+
+ENV GPU_COORD_PATH=/gpu_coord/status.json
+
+CMD ["python", "research/docs/efficient_benchmark_runner.py"]

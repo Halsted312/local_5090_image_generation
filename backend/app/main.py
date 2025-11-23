@@ -80,6 +80,9 @@ REWRITE_MODEL_ID = os.getenv("REWRITE_LLM_ID", os.getenv("ROUTER_LLM_ID", "Qwen/
 _rewrite_pipeline = None
 _rewrite_lock = threading.Lock()
 MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "768") or "768")
+GPU_COORD_PATH_ENV = os.getenv("GPU_COORD_PATH", "").strip()
+GPU_COORD_PATH = Path(GPU_COORD_PATH_ENV) if GPU_COORD_PATH_ENV else None
+GPU_COORD_GRACE_SECONDS = int(os.getenv("GPU_COORD_GRACE_SECONDS", "30") or "30")
 
 ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
@@ -153,6 +156,72 @@ def _free_cuda_memory() -> None:
             torch.cuda.ipc_collect()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _read_gpu_coord_owner() -> tuple[str | None, float | None]:
+    """Read current GPU owner and timestamp from coordination file."""
+    if not GPU_COORD_PATH or not GPU_COORD_PATH.exists():
+        return None, None
+    try:
+        data = json.loads(GPU_COORD_PATH.read_text())
+        return data.get("owner"), float(data.get("since", 0.0))
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _acquire_gpu_coord(owner: str) -> None:
+    """Mark GPU as owned by `owner`."""
+    if not GPU_COORD_PATH:
+        return
+    try:
+        GPU_COORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"owner": owner, "since": time.time()})
+        tmp_path = GPU_COORD_PATH.with_suffix(".tmp")
+        tmp_path.write_text(payload)
+        tmp_path.replace(GPU_COORD_PATH)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to acquire GPU coord for %s: %s", owner, exc)
+
+
+def _release_gpu_coord(owner: str) -> None:
+    """Clear ownership if we still hold it."""
+    if not GPU_COORD_PATH or not GPU_COORD_PATH.exists():
+        return
+    try:
+        data = json.loads(GPU_COORD_PATH.read_text())
+        if data.get("owner") != owner:
+            return
+    except Exception:
+        pass
+    try:
+        GPU_COORD_PATH.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to release GPU coord for %s: %s", owner, exc)
+
+
+def _wait_for_gpu(owner: str) -> None:
+    """If another owner holds the GPU, wait briefly for release before proceeding."""
+    if not GPU_COORD_PATH or not GPU_COORD_PATH.exists():
+        return
+    start = time.time()
+    while GPU_COORD_PATH.exists():
+        current_owner, since = _read_gpu_coord_owner()
+        if current_owner in (None, owner):
+            break
+        elapsed = time.time() - start
+        if elapsed > GPU_COORD_GRACE_SECONDS:
+            logger.warning(
+                "GPU coord owned by %s for %.1fs; proceeding for owner %s",
+                current_owner,
+                elapsed,
+                owner,
+            )
+            break
+        time.sleep(0.25)
 
 
 def _generate_unique_slug(db: Session, length: int = 5) -> str:
@@ -329,6 +398,20 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+@app.get("/gpu-status")
+def gpu_status() -> dict:
+    """Lightweight coordination endpoint for benchmark runner."""
+    owner, since = _read_gpu_coord_owner()
+    busy = owner is not None
+    return {
+        "busy": busy,
+        "owner": owner,
+        "since": since,
+        "grace_seconds": GPU_COORD_GRACE_SECONDS,
+        "path": str(GPU_COORD_PATH) if GPU_COORD_PATH else None,
+    }
+
+
 def _check_admin_rate_limit(request: Request) -> None:
     """
     Simple in-memory rate limiter per client IP for admin login.
@@ -392,6 +475,8 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
         generator_device = device
     generator = _make_generator(generator_device, request.seed)
     with generation_lock:
+        _wait_for_gpu(owner="backend")
+        _acquire_gpu_coord(owner="backend")
         try:
             result = pipe(
                 prompt=request.prompt,
@@ -469,7 +554,10 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
                 logger.exception("Image generation failed for model %s", selected)
                 raise HTTPException(status_code=500, detail="Image generation failed") from exc
         finally:
+            _release_gpu_coord(owner="backend")
             _free_cuda_memory()
+            # Brief pause to let CUDA allocator settle before next owner.
+            time.sleep(0.5)
 
     return image, selected
 

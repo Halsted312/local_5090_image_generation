@@ -9,6 +9,8 @@ Date: November 22, 2025
 import torch
 import time
 import json
+import os
+import sqlite3
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -29,6 +31,110 @@ logger = logging.getLogger(__name__)
 # Enable TF32 for NVIDIA GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+class GPULease:
+    """
+    File-based GPU lease that yields to backend.
+    Backend writes owner=backend; benchmark writes owner=benchmark.
+    The backend will wait briefly for the lease to clear; benchmark should only hold
+    for one generation, then release and flush CUDA.
+    """
+
+    def __init__(
+        self,
+        owner: str = "benchmark",
+        lease_path: str | None = None,
+        poll_interval: float = 1.0,
+        max_wait_seconds: int = 120,
+        stale_after_seconds: int = 600,
+    ) -> None:
+        env_path = lease_path or os.getenv("GPU_COORD_PATH", "/gpu_coord/status.json")
+        self.path = Path(env_path) if env_path else None
+        self.owner = owner
+        self.poll_interval = poll_interval
+        self.max_wait_seconds = max_wait_seconds
+        self.stale_after_seconds = stale_after_seconds
+
+    def _read(self) -> tuple[str | None, float | None]:
+        if not self.path or not self.path.exists():
+            return None, None
+        try:
+            data = json.loads(self.path.read_text())
+            return data.get("owner"), float(data.get("since", 0.0))
+        except Exception:
+            return None, None
+
+    def _write(self) -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"owner": self.owner, "since": time.time()})
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(payload)
+        tmp_path.replace(self.path)
+
+    def acquire(self) -> bool:
+        if not self.path:
+            return True
+        start = time.time()
+        while True:
+            try:
+                # Atomic create; fail if exists
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, json.dumps({"owner": self.owner, "since": time.time()}).encode("utf-8"))
+                os.close(fd)
+                return True
+            except FileExistsError:
+                owner, since = self._read()
+                now = time.time()
+                stale = since is not None and (now - since) > self.stale_after_seconds
+                if stale:
+                    try:
+                        self.path.unlink(missing_ok=True)
+                        logger.warning("Removed stale GPU lease (owner=%s, age=%.1fs)", owner, now - since)
+                        continue
+                    except Exception:
+                        pass
+                if owner and owner != self.owner:
+                    waited = now - start
+                    if waited > self.max_wait_seconds:
+                        logger.info("Still waiting on GPU lease held by %s for %.1fs", owner, waited)
+                    time.sleep(self.poll_interval)
+                else:
+                    # Same owner lingering; try to reclaim
+                    try:
+                        self.path.unlink(missing_ok=True)
+                    except Exception:
+                        time.sleep(self.poll_interval)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("GPU lease acquire error: %s", exc)
+                time.sleep(self.poll_interval)
+
+    def release(self) -> None:
+        if not self.path or not self.path.exists():
+            return
+        try:
+            owner, _ = self._read()
+            if owner != self.owner:
+                return
+            self.path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        time.sleep(0.5)  # brief calm period before backend reclaims GPU
 
 @dataclass
 class TestConfig:
@@ -79,6 +185,7 @@ class EfficientBenchmark:
     def __init__(self, output_dir: str = "./benchmark_results"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.output_dir / "benchmark.db"
         
         # Create subdirectories
         self.images_dir = self.output_dir / "images"
@@ -96,9 +203,13 @@ class EfficientBenchmark:
         
         # Load prompts
         self.prompts = self._load_prompts()
+        self._init_db()
+        self._sync_prompts()
         
         # GPU monitoring
         self.gpu = GPUtil.getGPUs()[0] if GPUtil.getGPUs() else None
+        # Coordination lease so backend can wait a few seconds while we finish a single image.
+        self.gpu_lease = GPULease(owner="benchmark")
     
     def _get_model_configs(self) -> Dict:
         """Get optimized parameters for each model"""
@@ -174,6 +285,102 @@ class EfficientBenchmark:
                 {"id": i, "prompt": f"Test prompt {i}", "category": "test"}
                 for i in range(1, 21)
             ]
+
+    def _init_db(self) -> None:
+        """Initialize SQLite schema for results and prompts."""
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phase TEXT,
+                timestamp TEXT,
+                model_id TEXT,
+                model_name TEXT,
+                prompt_id INTEGER,
+                prompt_category TEXT,
+                resolution_w INTEGER,
+                resolution_h INTEGER,
+                steps INTEGER,
+                guidance REAL,
+                use_tf32 INTEGER,
+                generation_time REAL,
+                time_per_step REAL,
+                time_per_megapixel REAL,
+                vram_used_mb REAL,
+                clip_score REAL,
+                aesthetic_score REAL,
+                success INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompts (
+                prompt_id INTEGER PRIMARY KEY,
+                category TEXT,
+                complexity TEXT,
+                prompt TEXT
+            )
+            """
+        )
+        self.conn.commit()
+
+    def _sync_prompts(self) -> None:
+        """Ensure prompts table is populated."""
+        if not hasattr(self, "conn"):
+            return
+        cur = self.conn.cursor()
+        rows = [
+            (p.get("id"), p.get("category"), p.get("complexity"), p.get("prompt"))
+            for p in self.prompts
+        ]
+        cur.executemany(
+            """
+            INSERT OR IGNORE INTO prompts (prompt_id, category, complexity, prompt)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def _record_result(self, result: Dict) -> None:
+        """Persist a single result row to SQLite."""
+        if not hasattr(self, "conn"):
+            return
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO runs (
+                phase, timestamp, model_id, model_name, prompt_id, prompt_category,
+                resolution_w, resolution_h, steps, guidance, use_tf32,
+                generation_time, time_per_step, time_per_megapixel,
+                vram_used_mb, clip_score, aesthetic_score, success
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.get("phase"),
+                result.get("timestamp"),
+                result.get("model_id"),
+                result.get("model_name"),
+                result.get("prompt_id"),
+                result.get("prompt_category"),
+                result.get("resolution")[0] if result.get("resolution") else None,
+                result.get("resolution")[1] if result.get("resolution") else None,
+                result.get("steps"),
+                result.get("guidance"),
+                int(bool(result.get("use_tf32"))),
+                result.get("generation_time"),
+                result.get("time_per_step"),
+                result.get("time_per_megapixel"),
+                result.get("vram_used_mb"),
+                result.get("clip_score"),
+                result.get("aesthetic_score"),
+                int(bool(result.get("success"))),
+            ),
+        )
+        self.conn.commit()
     
     def estimate_time(self, phase: str) -> timedelta:
         """Estimate time for each phase"""
@@ -197,6 +404,14 @@ class EfficientBenchmark:
             n_tests = 3 * 10 * 4
             avg_time = 12
             return timedelta(seconds=n_tests * avg_time)
+
+    def generate_with_lease(self, fn, *args, **kwargs):
+        """
+        Wrap a single generation under the GPU lease.
+        `fn` should perform one image generation and return metrics/image path.
+        """
+        with self.gpu_lease:
+            return fn(*args, **kwargs)
     
     def run_phase1_validation(self):
         """Phase 1: Quick validation with 3 models"""
@@ -236,6 +451,7 @@ class EfficientBenchmark:
                                 
                                 phase1_results.append(result)
                                 self.results.append(result)
+                                self._record_result(result)
                                 pbar.update(1)
                                 
                                 # Check time budget
@@ -295,6 +511,7 @@ class EfficientBenchmark:
                             
                             phase2_results.append(result)
                             self.results.append(result)
+                            self._record_result(result)
                             pbar.update(1)
                             
                             # Check time budget
@@ -351,6 +568,7 @@ class EfficientBenchmark:
                         
                         phase3_results.append(result)
                         self.results.append(result)
+                        self._record_result(result)
                         pbar.update(1)
                         
                         # Check time budget
@@ -378,67 +596,70 @@ class EfficientBenchmark:
     ) -> Dict:
         """Run a single benchmark test"""
         
-        # Clear cache
-        torch.cuda.empty_cache()
-        
-        # Record start metrics
-        vram_start, _ = self._get_gpu_metrics() if self.gpu else (0, 0)
-        
-        start_time = time.perf_counter()
-        
-        # ============================================
-        # PLACEHOLDER: Actual generation would go here
-        # ============================================
-        
-        # Simulate generation with appropriate delay
-        if model_id == "sdxl_lightning":
-            delay = np.random.uniform(0.8, 1.5)  # Fast model
-        elif model_id == "deepfloyd":
-            delay = np.random.uniform(10, 15)  # Slow model
-        else:
-            delay = np.random.uniform(3, 8)  # Medium models
-        
-        # Scale delay by resolution
-        resolution_factor = (resolution[0] * resolution[1]) / (512 * 512)
-        delay *= np.sqrt(resolution_factor)
-        
-        # Scale by steps
-        step_factor = steps / 30
-        delay *= step_factor
-        
-        time.sleep(min(delay, 15))  # Cap at 15 seconds for testing
-        
-        # End timing
-        end_time = time.perf_counter()
-        generation_time = end_time - start_time
-        
-        # Get final metrics
-        vram_end, _ = self._get_gpu_metrics() if self.gpu else (0, 0)
-        
-        # Simulate quality metrics
-        clip_score = np.random.uniform(0.25, 0.35) + (0.01 * steps / 30)
-        aesthetic_score = np.random.uniform(5.0, 8.0) + (0.5 * guidance / 7)
-        
-        return {
-            "phase": phase,
-            "timestamp": datetime.now().isoformat(),
-            "model_id": model_id,
-            "model_name": model_name,
-            "prompt_id": prompt['id'],
-            "prompt_category": prompt['category'],
-            "resolution": resolution,
-            "resolution_str": f"{resolution[0]}x{resolution[1]}",
-            "steps": steps,
-            "guidance": guidance,
-            "use_tf32": use_tf32,
-            "generation_time": generation_time,
-            "time_per_step": generation_time / steps,
-            "time_per_megapixel": generation_time / (resolution[0] * resolution[1] / 1e6),
-            "vram_used_mb": (vram_end - vram_start) * 1024,
-            "clip_score": clip_score,
-            "aesthetic_score": aesthetic_score,
-            "success": True
-        }
+        def _do_generation() -> Dict:
+            # Clear cache
+            torch.cuda.empty_cache()
+            
+            # Record start metrics
+            vram_start, _ = self._get_gpu_metrics() if self.gpu else (0, 0)
+            
+            start_time = time.perf_counter()
+            
+            # ============================================
+            # PLACEHOLDER: Actual generation would go here
+            # ============================================
+            
+            # Simulate generation with appropriate delay
+            if model_id == "sdxl_lightning":
+                delay = np.random.uniform(0.8, 1.5)  # Fast model
+            elif model_id == "deepfloyd":
+                delay = np.random.uniform(10, 15)  # Slow model
+            else:
+                delay = np.random.uniform(3, 8)  # Medium models
+            
+            # Scale delay by resolution
+            resolution_factor = (resolution[0] * resolution[1]) / (512 * 512)
+            delay *= np.sqrt(resolution_factor)
+            
+            # Scale by steps
+            step_factor = steps / 30
+            delay *= step_factor
+            
+            time.sleep(min(delay, 15))  # Cap at 15 seconds for testing
+            
+            # End timing
+            end_time = time.perf_counter()
+            generation_time = end_time - start_time
+            
+            # Get final metrics
+            vram_end, _ = self._get_gpu_metrics() if self.gpu else (0, 0)
+            
+            # Simulate quality metrics
+            clip_score = np.random.uniform(0.25, 0.35) + (0.01 * steps / 30)
+            aesthetic_score = np.random.uniform(5.0, 8.0) + (0.5 * guidance / 7)
+            
+            return {
+                "phase": phase,
+                "timestamp": datetime.now().isoformat(),
+                "model_id": model_id,
+                "model_name": model_name,
+                "prompt_id": prompt['id'],
+                "prompt_category": prompt['category'],
+                "resolution": resolution,
+                "resolution_str": f"{resolution[0]}x{resolution[1]}",
+                "steps": steps,
+                "guidance": guidance,
+                "use_tf32": use_tf32,
+                "generation_time": generation_time,
+                "time_per_step": generation_time / steps,
+                "time_per_megapixel": generation_time / (resolution[0] * resolution[1] / 1e6),
+                "vram_used_mb": (vram_end - vram_start) * 1024,
+                "clip_score": clip_score,
+                "aesthetic_score": aesthetic_score,
+                "success": True
+            }
+
+        return self.generate_with_lease(_do_generation)
     
     def _get_gpu_metrics(self) -> Tuple[float, float]:
         """Get GPU memory usage"""
