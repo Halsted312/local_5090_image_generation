@@ -32,6 +32,7 @@ from .models import GenerationLog, Prank, PrankTrigger
 from .prank_matching import get_prank_matcher_llm, match_prank_trigger
 from .model_registry import MODEL_REGISTRY
 from .router_engine import RoutingDecision, route_prompt
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from .schemas import (
     ImageResponse,
     PrankCreateResponse,
@@ -64,6 +65,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FLUX Image API + Prank Mode")
 
+# Enable TF32 for faster matmul on supported GPUs (e.g., 5090)
+torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+
 PRANK_DELAY_MS = int(os.getenv("PRANK_DELAY_MS", "0") or "0")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 ADMIN_TOKEN = secrets.token_urlsafe(32)
@@ -71,6 +76,10 @@ ADMIN_TOKEN_ISSUED = time.time()
 ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", str(24 * 3600)) or str(24 * 3600))
 ADMIN_LOGIN_WINDOW = int(os.getenv("ADMIN_LOGIN_WINDOW", "60") or "60")
 ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "10") or "10")
+REWRITE_MODEL_ID = os.getenv("REWRITE_LLM_ID", os.getenv("ROUTER_LLM_ID", "Qwen/Qwen2.5-1.5B-Instruct"))
+_rewrite_pipeline = None
+_rewrite_lock = threading.Lock()
+MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "768") or "768")
 
 ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
@@ -218,6 +227,74 @@ def _sleep_prank_delay() -> None:
         time.sleep(PRANK_DELAY_MS / 1000.0)
 
 
+def _get_rewrite_pipeline():
+    """Load or return the small LLM used to clean NSFW prompts."""
+    global _rewrite_pipeline
+    if _rewrite_pipeline is None:
+        with _rewrite_lock:
+            if _rewrite_pipeline is None:
+                logger.info("Loading rewrite LLM: %s", REWRITE_MODEL_ID)
+                _rewrite_pipeline = pipeline(
+                    "text-generation",
+                    model=AutoModelForCausalLM.from_pretrained(
+                        REWRITE_MODEL_ID,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                    ),
+                    tokenizer=AutoTokenizer.from_pretrained(REWRITE_MODEL_ID),
+                )
+    return _rewrite_pipeline
+
+
+def _rewrite_prompt_safe(prompt: str) -> str | None:
+    """
+    Ask small LLM to make prompt non-NSFW while preserving meaning.
+    Returns rewritten prompt or None on failure.
+    """
+    system = (
+        "The prompt below was flagged as NSFW by an image model, but the intent is safe. "
+        "Rewrite it to be clearly safe-for-work while preserving meaning. "
+        "Disambiguate any words that might imply drugs or explicit content "
+        "(e.g., 'weed' -> 'grass', 'burning grass' -> 'controlled burn of vegetation'). "
+        "Keep it concise; do not add new concepts."
+    )
+    try:
+        pipe = _get_rewrite_pipeline()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rewrite LLM unavailable: %s", exc)
+        return None
+    try:
+        outputs = pipe(
+            f"{system}\nPrompt: {prompt}\nRewritten:",
+            max_new_tokens=128,
+            do_sample=False,
+            temperature=0.3,
+            pad_token_id=pipe.tokenizer.eos_token_id,
+        )
+        text = outputs[0]["generated_text"]
+        # Heuristic: take the substring after 'Rewritten:' if present
+        marker = "Rewritten:"
+        if marker in text:
+            return text.split(marker, 1)[1].strip()
+        return text.strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rewrite LLM call failed: %s", exc)
+        return None
+
+
+def _is_black_image(image: Image.Image, threshold: int = 2) -> bool:
+    """
+    Detect if an image is essentially black (safety checker output).
+    threshold: max pixel value allowed to still count as black.
+    """
+    extrema = image.getextrema()
+    if isinstance(extrema[0], tuple):
+        # Multichannel
+        return all(channel_max <= threshold for _, channel_max in extrema)
+    # Single channel
+    return extrema[1] <= threshold
+
+
 def require_admin(x_admin_token: str = Header(..., alias="X-Admin-Token")) -> None:
     # Expire tokens after TTL; force re-login.
     if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
@@ -280,6 +357,8 @@ def _issue_admin_token() -> str:
 
 def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.Image, str]:
     """Execute the selected model, branching to the appropriate pipeline."""
+    # Clear any lingering CUDA allocations before selecting a pipeline.
+    _free_cuda_memory()
     selected = model_id
     generation_lock = app.state.generation_lock  # type: ignore[attr-defined]
     if model_id == "flux_dev":
@@ -323,9 +402,72 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
                 generator=generator,
             )
             image = result.images[0]
+            nsfw = getattr(result, "nsfw_content_detected", None)
+            if nsfw is not None:
+                logger.info("NSFW check for model %s prompt %r: %s", selected, request.prompt, nsfw)
+            # If flagged NSFW, attempt to rewrite prompt and retry once.
+            nsfw_flag = False
+            if isinstance(nsfw, list):
+                nsfw_flag = any(nsfw)
+            elif isinstance(nsfw, bool):
+                nsfw_flag = nsfw
+            if nsfw_flag or _is_black_image(image):
+                rewritten = _rewrite_prompt_safe(request.prompt)
+                if rewritten and rewritten != request.prompt:
+                    logger.info("Retrying generation for %s with rewritten safe prompt: %r -> %r", selected, request.prompt, rewritten)
+                    result = pipe(
+                        prompt=rewritten,
+                        num_inference_steps=num_steps,
+                        guidance_scale=guidance,
+                        width=request.width,
+                        height=request.height,
+                        generator=_make_generator(generator_device, request.seed),
+                    )
+                    image = result.images[0]
+                    nsfw_retry = getattr(result, "nsfw_content_detected", None)
+                    if nsfw_retry is not None:
+                        logger.info("NSFW check after rewrite for %s: %s", selected, nsfw_retry)
+                    if _is_black_image(image):
+                        logger.warning("Image still black after rewrite for %s", selected)
+                        if model_id == "logo_sdxl":
+                            # Last-resort fallback to flux_dev to avoid returning black image.
+                            pipe = get_text_pipeline()
+                            selected = "flux_dev"
+                            fallback_device = getattr(pipe, "device", "cpu")
+                            fallback_generator = _make_generator(fallback_device if str(fallback_device) != "meta" else "cpu", request.seed)
+                            result = pipe(
+                                prompt=rewritten,
+                                num_inference_steps=request.num_inference_steps,
+                                guidance_scale=request.guidance_scale,
+                                width=request.width,
+                                height=request.height,
+                                generator=fallback_generator,
+                            )
+                            image = result.images[0]
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Image generation failed for model %s", selected)
-            raise HTTPException(status_code=500, detail="Image generation failed") from exc
+            # If HiDream/logo path fails, fall back to flux_dev to return something instead of 500.
+            if model_id == "logo_sdxl":
+                logger.exception("Logo/HiDream generation failed, falling back to flux_dev")
+                try:
+                    pipe = get_text_pipeline()
+                    selected = "flux_dev"
+                    fallback_device = getattr(pipe, "device", "cpu")
+                    fallback_generator = _make_generator(fallback_device if str(fallback_device) != "meta" else "cpu", request.seed)
+                    result = pipe(
+                        prompt=request.prompt,
+                        num_inference_steps=request.num_inference_steps,
+                        guidance_scale=request.guidance_scale,
+                        width=request.width,
+                        height=request.height,
+                        generator=fallback_generator,
+                    )
+                    image = result.images[0]
+                except Exception as fallback_exc:  # noqa: BLE001
+                    logger.exception("Fallback to flux_dev also failed")
+                    raise HTTPException(status_code=500, detail="Image generation failed") from fallback_exc
+            else:
+                logger.exception("Image generation failed for model %s", selected)
+                raise HTTPException(status_code=500, detail="Image generation failed") from exc
         finally:
             _free_cuda_memory()
 
@@ -373,6 +515,12 @@ def _process_generation(
     share_slug: str | None = None,
     prank_id: str | None = None,
 ) -> ImageResponse:
+    # Clamp resolution for performance and VRAM headroom.
+    if request.width and request.width > MAX_IMAGE_SIDE:
+        request.width = MAX_IMAGE_SIDE
+    if request.height and request.height > MAX_IMAGE_SIDE:
+        request.height = MAX_IMAGE_SIDE
+
     start = time.time()
     if request.engine == "auto":
         decision = route_prompt(request.prompt)

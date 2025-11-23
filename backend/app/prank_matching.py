@@ -11,8 +11,17 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModel, AutoTokenizer as EmbeddingTokenizer
 
+from .config import (
+    PRANK_EMBED_MODEL_ID,
+    PRANK_EMBED_ACCEPT_THRESHOLD,
+    PRANK_EMBED_REJECT_THRESHOLD,
+    PRANK_MAX_LEN_RATIO,
+    PRANK_DISQUALIFY_TERMS,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -33,8 +42,7 @@ class MatchDebug:
 
 
 # Thresholds for deciding when to rely solely on heuristics vs calling the LLM.
-HIGH_CONFIDENCE_THRESHOLD = 0.95
-MIN_LLM_THRESHOLD = 0.25
+MIN_LLM_THRESHOLD = 0.25  # legacy LLM path (still used as a fallback)
 
 
 def _normalize(text: str) -> str:
@@ -56,41 +64,8 @@ def _jaccard(a_tokens: List[str], b_tokens: List[str]) -> float:
 
 
 def heuristic_match(prompt: str, triggers: List[str]) -> Tuple[Optional[int], List[float]]:
-    """
-    Heuristic matching:
-    - exact match
-    - substring/contains
-    - Jaccard token overlap
-    Returns (index, scores) where scores[i] is in [0,1].
-    """
-    prompt_norm = _normalize(prompt)
-    prompt_tokens = _tokenize(prompt_norm)
-
+    """Legacy heuristic placeholder; replaced by embedding similarity."""
     scores: List[float] = [0.0] * len(triggers)
-    best_idx: Optional[int] = None
-    best_score = 0.0
-
-    for i, trig in enumerate(triggers):
-        trig_norm = _normalize(trig)
-        trig_tokens = _tokenize(trig_norm)
-
-        score = 0.0
-
-        # exact
-        if prompt_norm == trig_norm:
-            score = 1.0
-        # substring
-        elif trig_norm in prompt_norm or prompt_norm in trig_norm:
-            score = 0.9
-        else:
-            j = _jaccard(prompt_tokens, trig_tokens)
-            score = 0.8 * j
-
-        scores[i] = score
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
     return None, scores
 
 
@@ -184,14 +159,15 @@ class PrankMatcherLLM:
 
         system = (
             "You are a prank trigger matcher. "
-            "Given a user prompt and a list of candidate triggers with heuristic scores, "
-            "pick the SINGLE best candidate index or -1 if none match. "
+            "Given a user prompt and a list of candidate triggers with similarity scores, "
+            "pick the SINGLE best candidate index ONLY if the prompt describes the SAME SCENARIO as that trigger, "
+            "without adding new actions/objects/people/locations. If none match, return -1. "
             'Respond ONLY with a JSON object: {"index": <int>} and nothing else.'
         )
 
         numbered = []
         for i, (text, score) in enumerate(zip(candidate_texts, candidate_scores)):
-            numbered.append(f"{i}: {text!r} (heuristic_score={score:.3f})")
+            numbered.append(f"{i}: {text!r} (sim_score={score:.3f})")
         numbered_str = "\n".join(numbered)
 
         user = f"User prompt: {prompt!r}\nCandidates:\n{numbered_str}\n"
@@ -236,6 +212,13 @@ class PrankMatcherLLM:
 PRANK_MATCHER_LLM: PrankMatcherLLM | None = None
 _GLOBAL_LLM_LOCK = threading.Lock()
 
+# Embedding model globals
+_EMBED_MODEL = None
+_EMBED_TOKENIZER = None
+_EMBED_LOCK = threading.Lock()
+_EMBED_CACHE: Dict[str, torch.Tensor] = {}
+_EMBED_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def get_prank_matcher_llm() -> PrankMatcherLLM | None:
     """
@@ -253,6 +236,37 @@ def get_prank_matcher_llm() -> PrankMatcherLLM | None:
     return PRANK_MATCHER_LLM
 
 
+def _load_embedder():
+    global _EMBED_MODEL, _EMBED_TOKENIZER
+    if _EMBED_MODEL is None or _EMBED_TOKENIZER is None:
+        with _EMBED_LOCK:
+            if _EMBED_MODEL is None or _EMBED_TOKENIZER is None:
+                logger.info("Loading prank embedding model: %s on %s", PRANK_EMBED_MODEL_ID, _EMBED_DEVICE)
+                _EMBED_TOKENIZER = EmbeddingTokenizer.from_pretrained(PRANK_EMBED_MODEL_ID)
+                _EMBED_MODEL = AutoModel.from_pretrained(PRANK_EMBED_MODEL_ID).to(_EMBED_DEVICE)
+
+
+def _embed(text: str) -> torch.Tensor:
+    text = _normalize(text)
+    if text in _EMBED_CACHE:
+        return _EMBED_CACHE[text]
+    _load_embedder()
+    assert _EMBED_MODEL is not None and _EMBED_TOKENIZER is not None
+    with torch.no_grad():
+        tokens = _EMBED_TOKENIZER(text, return_tensors="pt", truncation=True).to(_EMBED_DEVICE)
+        model_out = _EMBED_MODEL(**tokens)
+        embeddings = model_out.last_hidden_state
+        # Mean pooling
+        attention_mask = tokens["attention_mask"].unsqueeze(-1)
+        summed = torch.sum(embeddings * attention_mask, dim=1)
+        counts = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+        pooled = summed / counts
+        pooled = F.normalize(pooled, p=2, dim=1)
+        vec = pooled[0].detach().cpu()
+        _EMBED_CACHE[text] = vec
+        return vec
+
+
 # ---------------------------------------------------------------------------
 # Unified match function
 # ---------------------------------------------------------------------------
@@ -265,72 +279,83 @@ def match_prank_trigger(
     top_k: int = 2,
 ) -> Tuple[Optional[int], MatchDebug]:
     """
-    Use heuristics to score triggers; delegate to LLM to pick among top candidates when needed.
+    Use embeddings + optional LLM confirmation to pick the best trigger.
+    - Normalize inputs
+    - Compute cosine similarities
+    - Disqualify when prompt adds violent/sexual/action terms not in trigger
+    - Accept if high cosine AND no disqualifiers
+    - Otherwise ask LLM to confirm “same scenario”
     """
-    heuristic_idx, scores = heuristic_match(prompt, triggers)
-
-    # No triggers at all
+    prompt_norm = _normalize(prompt)
     if not triggers:
-        debug = MatchDebug(
-            prompt=prompt,
-            triggers=triggers,
-            heuristic_idx=None,
-            heuristic_scores=[],
-            used_llm=False,
-            llm_idx=None,
-            final_idx=None,
-        )
+        debug = MatchDebug(prompt=prompt, triggers=triggers, heuristic_idx=None, heuristic_scores=[], used_llm=False, llm_idx=None, final_idx=None)
         logger.info("Prank match debug: %s", debug)
         return None, debug
+
+    prompt_tokens = set(_tokenize(prompt_norm))
+    trigger_tokens = [_tokenize(_normalize(t)) for t in triggers]
+    trig_norms = [_normalize(t) for t in triggers]
+
+    # Disqualifier helper: if prompt adds disallowed terms not present in trigger
+    def _has_disqualifier(idx: int) -> bool:
+        trig_set = set(trigger_tokens[idx])
+        new_terms = prompt_tokens - trig_set
+        for term in PRANK_DISQUALIFY_TERMS:
+            if term in new_terms:
+                return True
+        return False
+
+    # Compute embeddings
+    prompt_vec = _embed(prompt_norm)
+    trig_vecs = [_embed(tn) for tn in trig_norms]
+    scores = []
+    for i, vec in enumerate(trig_vecs):
+        sim = float(torch.matmul(prompt_vec, vec))
+        if _has_disqualifier(i):
+            sim = 0.0
+        scores.append(sim)
 
     ranked = sorted(enumerate(scores), key=lambda kv: kv[1], reverse=True)
     best_idx, best_score = ranked[0]
 
-    # If heuristics are extremely confident, short-circuit.
-    if best_score >= HIGH_CONFIDENCE_THRESHOLD:
-        final_idx = best_idx
-        debug = MatchDebug(
-            prompt=prompt,
-            triggers=triggers,
-            heuristic_idx=heuristic_idx,
-            heuristic_scores=scores,
-            used_llm=False,
-            llm_idx=None,
-            final_idx=final_idx,
-        )
-        logger.info("Prank match debug (heuristics only): %s", debug)
-        return final_idx, debug
+    # Quick accept if very close and lengths are comparable
+    prompt_len = max(len(prompt_tokens), 1)
+    trig_len = max(len(trigger_tokens[best_idx]), 1)
+    len_ratio = prompt_len / trig_len
 
+    final_idx: Optional[int] = None
     used_llm = False
-    llm_global_idx: Optional[int] = None
+    llm_idx: Optional[int] = None
 
-    # Only consider LLM if we have a configured model and a minimally reasonable heuristic score.
-    if llm is not None and best_score >= MIN_LLM_THRESHOLD:
-        used_llm = True
-        candidates = ranked[: max(1, min(top_k, len(ranked)))]
-        candidate_indices = [i for (i, _) in candidates]
-        candidate_texts = [triggers[i] for i in candidate_indices]
-        candidate_scores = [scores[i] for i in candidate_indices]
-
-        llm_local_idx = llm.choose_with_candidates(prompt, candidate_texts, candidate_scores)
-        if llm_local_idx is not None and 0 <= llm_local_idx < len(candidate_indices):
-            llm_global_idx = candidate_indices[llm_local_idx]
-
-    # Determine final index with fallbacks.
-    if llm_global_idx is not None:
-        final_idx = llm_global_idx
-    elif best_score >= MIN_LLM_THRESHOLD:
+    if best_score >= PRANK_EMBED_ACCEPT_THRESHOLD and len_ratio <= PRANK_MAX_LEN_RATIO:
         final_idx = best_idx
-    else:
+    elif best_score < PRANK_EMBED_REJECT_THRESHOLD:
         final_idx = None
+    else:
+        # Borderline: ask LLM to confirm “same scenario”
+        if llm is not None:
+            used_llm = True
+            candidates = ranked[: max(1, min(top_k, len(ranked)))]
+            candidate_indices = [i for (i, _) in candidates]
+            candidate_texts = [trig_norms[i] for i in candidate_indices]
+            candidate_scores = [scores[i] for i in candidate_indices]
+
+            # Use existing chooser but prompt is stricter in the class.
+            llm_local_idx = llm.choose_with_candidates(prompt_norm, candidate_texts, candidate_scores)
+            if llm_local_idx is not None and 0 <= llm_local_idx < len(candidate_indices):
+                llm_idx = candidate_indices[llm_local_idx]
+                final_idx = llm_idx
+        # If LLM not available or declined, reject unless score is very high and length ratio okay
+        if final_idx is None and best_score >= PRANK_EMBED_ACCEPT_THRESHOLD and len_ratio <= PRANK_MAX_LEN_RATIO:
+            final_idx = best_idx
 
     debug = MatchDebug(
         prompt=prompt,
         triggers=triggers,
-        heuristic_idx=heuristic_idx,
+        heuristic_idx=None,
         heuristic_scores=scores,
         used_llm=used_llm,
-        llm_idx=llm_global_idx,
+        llm_idx=llm_idx,
         final_idx=final_idx,
     )
     logger.info("Prank match debug: %s", debug)

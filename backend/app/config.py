@@ -23,6 +23,23 @@ HIDREAM_GUIDANCE: float = float(os.getenv("HIDREAM_GUIDANCE", "5.0"))
 # Llama text encoder for HiDream
 HIDREAM_TEXT_ENCODER_ID: str = os.getenv("HIDREAM_TEXT_ENCODER_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 
+# Prank matching (embeddings + LLM)
+PRANK_EMBED_MODEL_ID: str = os.getenv("PRANK_EMBED_MODEL_ID", "BAAI/bge-small-en-v1.5")
+PRANK_EMBED_ACCEPT_THRESHOLD: float = float(os.getenv("PRANK_EMBED_ACCEPT_THRESHOLD", "0.93"))
+PRANK_EMBED_REJECT_THRESHOLD: float = float(os.getenv("PRANK_EMBED_REJECT_THRESHOLD", "0.70"))
+PRANK_MAX_LEN_RATIO: float = float(os.getenv("PRANK_MAX_LEN_RATIO", "1.4"))  # prompt_len / trigger_len
+PRANK_DISQUALIFY_TERMS: list[str] = [
+    t.strip().lower()
+    for t in (
+        os.getenv(
+            "PRANK_DISQUALIFY_TERMS",
+            "banging,burning,killing,exploding,knife,gun,shoot,stab,dead,death,sexual,nsfw,violent,abuse",
+        )
+        .split(",")
+    )
+    if t.strip()
+]
+
 DeviceType = Literal["cuda", "cpu"]
 
 

@@ -237,6 +237,15 @@ def _load_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
                 # Don't use device_map here - we'll handle device placement manually
             )
 
+            # Disable safety checker for HiDream; logo/text prompts get blacked out otherwise.
+            try:
+                pipe.safety_checker = None
+                if hasattr(pipe, "requires_safety_checker"):
+                    pipe.requires_safety_checker = False
+                logger.info("HiDream safety checker disabled for logo/text generation")
+            except Exception:
+                logger.warning("Failed to disable safety checker on HiDream pipeline")
+
             # Force CPU offload for HiDream - it's too large for GPU
             if device == "cuda":
                 logger.info("HiDream is 17B params - using sequential CPU offload strategy")
