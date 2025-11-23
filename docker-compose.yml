@@ -60,7 +60,7 @@ services:
       - hf_cache:/root/.cache/huggingface
       - ./research:/workspace/research:ro
       - ./research/benchmark_results:/workspace/benchmark_results
-    command: ["python", "research/docs/efficient_benchmark_runner.py"]
+    command: ["python", "research/benchmarks/efficient_benchmark_runner.py"]
     deploy:
       resources:
         reservations:

@@ -27,7 +27,7 @@ services:
       - hf_cache:/root/.cache/huggingface
       - ./research:/workspace/research:ro
       - ./research/benchmark_results:/workspace/benchmark_results
-    command: ["python", "research/docs/efficient_benchmark_runner.py"]
+    command: ["python", "research/benchmarks/efficient_benchmark_runner.py"]
     deploy:
       resources:
         reservations:
@@ -48,13 +48,13 @@ COPY research/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV GPU_COORD_PATH=/gpu_coord/status.json
-CMD ["python", "research/docs/efficient_benchmark_runner.py"]
+CMD ["python", "research/benchmarks/efficient_benchmark_runner.py"]
 ```
 
 ## Folder layout (research/)
-- `research/docs/efficient_benchmark_runner.py` — runner logic with GPU lease wrapper
+- `research/benchmarks/efficient_benchmark_runner.py` — runner logic with GPU lease wrapper
 - `research/docs/research_runner_docker.md` — this setup note
-- `research/benchmark_prompts_v2.json` — 100 prompts (read-only mount)
+- `research/data/benchmark_prompts_v2.json` — 100 prompts (read-only mount)
 - `research/benchmark_results/` — outputs/images/db (writeable volume)
 - `research/models/` — optional local weights if not relying solely on HF cache
 - `research/requirements.txt` — deps for the runner (torch/clip/aesthetic/etc.)

@@ -1,5 +1,3 @@
-torch==2.3.1
-torchvision==0.18.1
 pandas
 numpy
 psutil
@@ -18,3 +16,5 @@ sentencepiece
 protobuf
 scipy
 opencv-python-headless
+aesthetic-predictor
+hf_transfer

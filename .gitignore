@@ -20,3 +20,4 @@ frontend/vite.config.d.ts
 
 # Local prank image storage
 prank_images/
+research/benchmark_results/testing/images/

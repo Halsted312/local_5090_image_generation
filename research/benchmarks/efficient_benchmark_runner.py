@@ -23,6 +23,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import logging
+from diffusers import AutoPipelineForText2Image
+import open_clip
+from aesthetic_predictor import predict_aesthetic
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -135,6 +138,159 @@ class GPULease:
         except Exception:
             pass
         time.sleep(0.5)  # brief calm period before backend reclaims GPU
+
+
+class QuickLightningBenchmark:
+    """
+    Minimal benchmark runner for SDXL-Turbo/Lightning over 100 prompts.
+    Parameterized: steps list, TF32 on/off list. Saves CSV + images with descriptive names.
+    """
+
+    def __init__(
+        self,
+        prompts: List[Dict],
+        output_root: Path,
+        lease: GPULease,
+        steps_options: List[int] | None = None,
+        tf32_options: List[bool] | None = None,
+    ) -> None:
+        self.prompts = prompts
+        self.output_root = output_root
+        self.images_dir = output_root / "images"
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.lease = lease
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_id = "sdxl_turbo"
+        self.model_name = "SDXL-Turbo"
+        self.pipeline = None
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.clip_tokenizer = None
+        self.steps_options = steps_options or [4]
+        self.tf32_options = tf32_options or [True]
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _load_models(self) -> None:
+        if self.pipeline is None:
+            self.pipeline = AutoPipelineForText2Image.from_pretrained(
+                "stabilityai/sdxl-turbo",
+                torch_dtype=torch.float16,
+                variant="fp16",
+                use_safetensors=True,
+                cache_dir=os.environ.get("HF_HOME"),
+            ).to(self.device)
+            self.pipeline.set_progress_bar_config(disable=True)
+        if self.clip_model is None:
+            self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+                "ViT-bigG-14",
+                pretrained="laion2b_s39b_b160k",
+                device=self.device,
+            )
+            self.clip_tokenizer = open_clip.get_tokenizer("ViT-bigG-14")
+
+    def _clip_score(self, image, text: str) -> float:
+        # image: PIL.Image.Image
+        image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+        text_input = self.clip_tokenizer([text]).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_feat = self.clip_model.encode_image(image_input)
+            text_feat = self.clip_model.encode_text(text_input)
+        image_feat /= image_feat.norm(dim=-1, keepdim=True)
+        text_feat /= text_feat.norm(dim=-1, keepdim=True)
+        sim = (image_feat * text_feat).sum(dim=-1)
+        return float(sim.item())
+
+    def _aesthetic_score(self, image) -> Optional[float]:
+        try:
+            score = predict_aesthetic(image, model_type="large")
+            # predict_aesthetic returns a tensor
+            return float(score.squeeze().item())
+        except Exception:
+            return None
+
+    def run(self, seed: int = 42) -> Path:
+        self._load_models()
+        results = []
+        csv_path = self.output_root / "quick_sdxl_lightning.csv"
+
+        for prompt_obj in tqdm(self.prompts, desc="Quick SDXL-Lightning"):
+            prompt_text = prompt_obj["prompt"]
+            prompt_id = prompt_obj["id"]
+            category = prompt_obj.get("category")
+            complexity = prompt_obj.get("complexity")
+            # Token length via pipeline tokenizer
+            token_len = None
+            try:
+                token_len = len(self.pipeline.tokenizer(prompt_text).input_ids[0])
+            except Exception:
+                pass
+
+            for use_tf32 in self.tf32_options:
+                torch.backends.cuda.matmul.allow_tf32 = use_tf32
+                torch.backends.cudnn.allow_tf32 = use_tf32
+
+                for steps in self.steps_options:
+                    def _generate_one():
+                        torch.cuda.empty_cache()
+                        start_time = time.perf_counter()
+                        gen = self.pipeline(
+                            prompt=prompt_text,
+                            num_inference_steps=steps,
+                            guidance_scale=0.0,
+                            width=512,
+                            height=512,
+                            generator=torch.Generator(device=self.device).manual_seed(seed),
+                        )
+                        image = gen.images[0]
+                        gen_ms = (time.perf_counter() - start_time) * 1000.0
+                        vram_mb = 0.0
+                        try:
+                            vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                        except Exception:
+                            pass
+                        return image, gen_ms, vram_mb
+
+                    with self.lease:
+                        image, gen_ms, vram_mb = _generate_one()
+
+                    clip_score = self._clip_score(image, prompt_text)
+                    aesthetic_score = self._aesthetic_score(image)
+
+                    filename = f"{self.model_id}_{self.run_id}_prompt{prompt_id}_steps{steps}_tf32{int(use_tf32)}_seed{seed}.png"
+                    image_path = self.images_dir / filename
+                    try:
+                        image.save(image_path)
+                    except Exception:
+                        image_path = None
+
+                    result = {
+                        "run_id": self.run_id,
+                        "prompt_id": prompt_id,
+                        "prompt": prompt_text,
+                        "prompt_length_chars": len(prompt_text),
+                        "prompt_length_tokens": token_len,
+                        "category": category,
+                        "complexity": complexity,
+                        "model_id": self.model_id,
+                        "model_name": self.model_name,
+                        "resolution_w": 512,
+                        "resolution_h": 512,
+                        "steps": steps,
+                        "guidance": 0.0,
+                        "tf32_enabled": use_tf32,
+                        "gen_ms": gen_ms,
+                        "vram_peak_mb": vram_mb,
+                        "clip_score": clip_score,
+                        "aesthetic_score": aesthetic_score,
+                        "image_path": str(image_path) if image_path else None,
+                        "started_at": datetime.now().isoformat(),
+                    }
+                    results.append(result)
+
+        df = pd.DataFrame(results)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(csv_path, index=False)
+        return csv_path
 
 @dataclass
 class TestConfig:
@@ -274,7 +430,7 @@ class EfficientBenchmark:
     
     def _load_prompts(self) -> List[Dict]:
         """Load benchmark prompts"""
-        prompt_file = Path("benchmark_prompts_v2.json")
+        prompt_file = Path(__file__).resolve().parents[1] / "data" / "benchmark_prompts_v2.json"
         if prompt_file.exists():
             with open(prompt_file, 'r') as f:
                 data = json.load(f)
@@ -910,6 +1066,19 @@ class EfficientBenchmark:
 
 def main():
     """Main entry point"""
+    mode = os.environ.get("BENCHMARK_MODE", "").lower()
+    if mode == "quick_sdxl_lightning":
+        print("Running quick SDXL-Turbo benchmark (100 prompts @512, param sweep for steps and TF32).")
+        prompts_path = Path(__file__).resolve().parents[1] / "data" / "benchmark_prompts_v2.json"
+        with open(prompts_path, "r") as f:
+            prompts = json.load(f)["prompts"]
+        output_root = Path(os.environ.get("OUTPUT_ROOT", "/workspace/benchmark_results/testing"))
+        lease = GPULease(owner="benchmark")
+        runner = QuickLightningBenchmark(prompts=prompts, output_root=output_root, lease=lease)
+        csv_path = runner.run()
+        print(f"Quick benchmark complete. CSV: {csv_path}")
+        return
+
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║   Efficient Image Generation Benchmark (15-hour budget)  ║

@@ -1,12 +1,20 @@
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV FORCE_CUDA=1
 
 WORKDIR /workspace
 
+# Install only project deps (torch/vision already in base)
 COPY research/requirements.txt /workspace/requirements.txt
-RUN pip install --no-cache-dir -r /workspace/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /workspace/requirements.txt
 
+# Copy code
 COPY . /workspace
 
 ENV GPU_COORD_PATH=/gpu_coord/status.json
 
-CMD ["python", "research/docs/efficient_benchmark_runner.py"]
+CMD ["python", "research/benchmarks/efficient_benchmark_runner.py"]

@@ -1,14 +1,15 @@
 # Research Benchmark Structure
 
 Folders
-- `research/docs/` – study notes, runner code, docker setup.
+- `research/docs/` – study notes, docker setup docs (no code).
+- `research/benchmarks/` – runner code with GPU lease + logging.
+- `research/data/` – datasets/configs (e.g., `benchmark_prompts_v2.json`).
 - `research/benchmark_results/` – CSV/JSON/SQLite outputs and images (mounted RW in benchmark container).
 - `research/models/` – optional local copies if you decide to persist weights outside the HF cache.
 - `research/scripts/` – utilities (e.g., `prefetch_models.sh`).
-- `research/benchmark_prompts_v2.json` – 100 benchmark prompts (mounted RO).
 
 Key files
-- `research/docs/efficient_benchmark_runner.py` – runner with GPU lease + logging.
+- `research/benchmarks/efficient_benchmark_runner.py` – runner with GPU lease + logging.
 - `research/Dockerfile.benchmark` – image for benchmark service.
 - `research/requirements.txt` – deps (diffusers/transformers/clip/aesthetic/etc.).
 - `research/docs/research_runner_docker.md` – compose/mount guidance.
