@@ -292,6 +292,170 @@ class QuickLightningBenchmark:
         df.to_csv(csv_path, index=False)
         return csv_path
 
+
+class MultiModelSweep:
+    """
+    Sweep across multiple models, steps, and TF32 settings over all prompts.
+    """
+
+    MODEL_REGISTRY = {
+        "sdxl_turbo": {"name": "SDXL-Turbo", "repo": "stabilityai/sdxl-turbo", "guidance": 0.0},
+        "flux_dev": {"name": "FLUX.1-dev", "repo": "black-forest-labs/FLUX.1-dev", "guidance": 4.5},
+        "realvis_xl": {"name": "RealVisXL", "repo": "SG161222/Realistic_Vision_V5.1_noVAE", "guidance": 5.5},
+        "sd3_medium": {"name": "SD3 Medium", "repo": "stabilityai/stable-diffusion-3-medium", "guidance": 6.5},
+        "sdxl": {"name": "SDXL 1.0", "repo": "stabilityai/stable-diffusion-xl-base-1.0", "guidance": 7.0},
+        "hidream": {"name": "HiDream-I1", "repo": "HiDream-ai/HiDream-I1-Full", "guidance": 4.0},
+        "deepfloyd": {"name": "DeepFloyd IF", "repo": "DeepFloyd/IF-I-XL-v1.0", "guidance": 6.0},
+    }
+
+    def __init__(
+        self,
+        prompts: List[Dict],
+        output_root: Path,
+        lease: GPULease,
+        steps_options: List[int] | None = None,
+        tf32_options: List[bool] | None = None,
+    ) -> None:
+        self.prompts = prompts
+        self.output_root = output_root
+        self.images_dir = output_root / "images"
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.lease = lease
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.steps_options = steps_options or [4, 8, 16, 24, 32, 40, 48]
+        self.tf32_options = tf32_options or [True, False]
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.clip_tokenizer = None
+
+    def _load_clip(self) -> None:
+        if self.clip_model is None:
+            self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+                "ViT-bigG-14",
+                pretrained="laion2b_s39b_b160k",
+                device=self.device,
+            )
+            self.clip_tokenizer = open_clip.get_tokenizer("ViT-bigG-14")
+
+    def _clip_score(self, image, text: str) -> float:
+        image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+        text_input = self.clip_tokenizer([text]).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_feat = self.clip_model.encode_image(image_input)
+            text_feat = self.clip_model.encode_text(text_input)
+        image_feat /= image_feat.norm(dim=-1, keepdim=True)
+        text_feat /= text_feat.norm(dim=-1, keepdim=True)
+        sim = (image_feat * text_feat).sum(dim=-1)
+        return float(sim.item())
+
+    def _aesthetic_score(self, image) -> Optional[float]:
+        try:
+            score = predict_aesthetic(image, model_type="large")
+            return float(score.squeeze().item())
+        except Exception:
+            return None
+
+    def _load_pipeline(self, repo_id: str):
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            repo_id,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+            cache_dir=os.environ.get("HF_HOME"),
+            token=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+        ).to(self.device)
+        pipe.set_progress_bar_config(disable=True)
+        return pipe
+
+    def run(self, seed: int = 42) -> Path:
+        self._load_clip()
+        results = []
+        csv_path = self.output_root / f"multi_model_sweep_{self.run_id}.csv"
+
+        for model_id, cfg in self.MODEL_REGISTRY.items():
+            model_name = cfg["name"]
+            repo = cfg["repo"]
+            guidance = cfg["guidance"]
+            pipe = self._load_pipeline(repo)
+
+            for prompt_obj in tqdm(self.prompts, desc=f"{model_name}"):
+                prompt_text = prompt_obj["prompt"]
+                prompt_id = prompt_obj["id"]
+                category = prompt_obj.get("category")
+                complexity = prompt_obj.get("complexity")
+                token_len = None
+                try:
+                    token_len = len(pipe.tokenizer(prompt_text).input_ids[0])
+                except Exception:
+                    pass
+
+                for use_tf32 in self.tf32_options:
+                    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+                    torch.backends.cudnn.allow_tf32 = use_tf32
+
+                    for steps in self.steps_options:
+                        def _generate_one():
+                            torch.cuda.empty_cache()
+                            start_time = time.perf_counter()
+                            gen = pipe(
+                                prompt=prompt_text,
+                                num_inference_steps=steps,
+                                guidance_scale=guidance,
+                                width=512,
+                                height=512,
+                                generator=torch.Generator(device=self.device).manual_seed(seed),
+                            )
+                            image = gen.images[0]
+                            gen_ms = (time.perf_counter() - start_time) * 1000.0
+                            vram_mb = 0.0
+                            try:
+                                vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                            except Exception:
+                                pass
+                            return image, gen_ms, vram_mb
+
+                        with self.lease:
+                            image, gen_ms, vram_mb = _generate_one()
+
+                        clip_score = self._clip_score(image, prompt_text)
+                        aesthetic_score = self._aesthetic_score(image)
+
+                        filename = f"{model_id}_{self.run_id}_prompt{prompt_id}_steps{steps}_tf32{int(use_tf32)}_seed{seed}.png"
+                        image_path = self.images_dir / filename
+                        try:
+                            image.save(image_path)
+                        except Exception:
+                            image_path = None
+
+                        results.append({
+                            "run_id": self.run_id,
+                            "model_id": model_id,
+                            "model_name": model_name,
+                            "prompt_id": prompt_id,
+                            "prompt": prompt_text,
+                            "prompt_length_chars": len(prompt_text),
+                            "prompt_length_tokens": token_len,
+                            "category": category,
+                            "complexity": complexity,
+                            "resolution_w": 512,
+                            "resolution_h": 512,
+                            "steps": steps,
+                            "guidance": guidance,
+                            "tf32_enabled": use_tf32,
+                            "gen_ms": gen_ms,
+                            "vram_peak_mb": vram_mb,
+                            "clip_score": clip_score,
+                            "aesthetic_score": aesthetic_score,
+                            "image_path": str(image_path) if image_path else None,
+                            "started_at": datetime.now().isoformat(),
+                        })
+
+        df = pd.DataFrame(results)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(csv_path, index=False)
+        return csv_path
+
 @dataclass
 class TestConfig:
     """Configuration for efficient testing"""
@@ -1077,6 +1241,17 @@ def main():
         runner = QuickLightningBenchmark(prompts=prompts, output_root=output_root, lease=lease)
         csv_path = runner.run()
         print(f"Quick benchmark complete. CSV: {csv_path}")
+        return
+    if mode == "multi_model_sweep":
+        print("Running multi-model sweep (all prompts, steps/TF32 grid).")
+        prompts_path = Path(__file__).resolve().parents[1] / "data" / "benchmark_prompts_v2.json"
+        with open(prompts_path, "r") as f:
+            prompts = json.load(f)["prompts"]
+        output_root = Path(os.environ.get("OUTPUT_ROOT", "/workspace/benchmark_results/overnight"))
+        lease = GPULease(owner="benchmark")
+        runner = MultiModelSweep(prompts=prompts, output_root=output_root, lease=lease)
+        csv_path = runner.run()
+        print(f"Multi-model sweep complete. CSV: {csv_path}")
         return
 
     print("""
