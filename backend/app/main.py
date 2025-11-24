@@ -11,17 +11,20 @@ import string
 import threading
 import time
 from typing import Iterable
+import asyncio
 
 import torch
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi import File, Form, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.websockets import WebSocketDisconnect
 from PIL import Image
 from pathlib import Path
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
+from .queue_manager import GenerationQueue, QueueFull
 from .flux_models import (
     get_logo_pipeline,
     get_realvis_pipeline,
@@ -79,10 +82,11 @@ ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "10") or "1
 REWRITE_MODEL_ID = os.getenv("REWRITE_LLM_ID", os.getenv("ROUTER_LLM_ID", "Qwen/Qwen2.5-1.5B-Instruct"))
 _rewrite_pipeline = None
 _rewrite_lock = threading.Lock()
-MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "768") or "768")
+MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "512") or "512")
 GPU_COORD_PATH_ENV = os.getenv("GPU_COORD_PATH", "").strip()
 GPU_COORD_PATH = Path(GPU_COORD_PATH_ENV) if GPU_COORD_PATH_ENV else None
 GPU_COORD_GRACE_SECONDS = int(os.getenv("GPU_COORD_GRACE_SECONDS", "30") or "30")
+GEN_QUEUE_CAPACITY = int(os.getenv("GEN_QUEUE_CAPACITY", "64") or "64")
 
 ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
@@ -102,6 +106,15 @@ app.add_middleware(
 )
 
 SLUG_ALPHABET = string.ascii_letters + string.digits
+GEN_QUEUE = GenerationQueue(capacity=GEN_QUEUE_CAPACITY)
+
+# Fast, model-specific preset steps/guidance (ignore frontend sliders for speed).
+MODEL_PRESETS: dict[str, dict[str, float]] = {
+    "flux_dev": {"steps": 4, "guidance": 0.0},
+    "realvis_xl": {"steps": 8, "guidance": 2.0},
+    "sd3_medium": {"steps": 18, "guidance": 6.5},
+    "logo_sdxl": {"steps": 20, "guidance": 4.5},
+}
 
 
 @app.on_event("startup")
@@ -622,6 +635,12 @@ def _process_generation(
             reason="Manual engine override",
         )
 
+    # Override steps/guidance with fast presets per model to ignore frontend sliders.
+    preset = MODEL_PRESETS.get(chosen_model)
+    if preset:
+        request.num_inference_steps = int(preset["steps"])
+        request.guidance_scale = float(preset["guidance"])
+
     image, actual_model = _execute_model(chosen_model, request)
     image_path, thumb_path = save_generation_image(image)
     generation_time_ms = int((time.time() - start) * 1000)
@@ -727,7 +746,33 @@ def generate_image(
     request: TextGenerateRequest,
     db: Session = Depends(get_db),
 ) -> ImageResponse:
-    return _process_generation(request, db)
+    session_id = request.session_id or "anon"
+    try:
+        job = GEN_QUEUE.enqueue(session_id)
+    except QueueFull:
+        raise HTTPException(status_code=429, detail="Queue is full, please retry shortly")
+
+    # Block until this job reaches the front of the queue.
+    GEN_QUEUE.wait_for_turn(job["generation_id"])
+
+    try:
+        resp = _process_generation(request, db)
+        GEN_QUEUE.release(
+            job["generation_id"],
+            success=True,
+            payload={
+                "image_base64": resp.image_base64,
+                "model_used": resp.model_used or resp.model_id,
+            },
+        )
+        return resp
+    except Exception as exc:  # noqa: BLE001
+        GEN_QUEUE.release(
+            job["generation_id"],
+            success=False,
+            payload={"error": str(exc)},
+        )
+        raise
 
 
 def _prank_to_response(prank: Prank, triggers: list[PrankTrigger]) -> dict:
@@ -1009,106 +1054,148 @@ def generate_prank_image(
     request: PrankGenerateRequest,
     db: Session = Depends(get_db),
 ) -> ImageResponse:
-    prank = _get_prank_by_slug(db, slug)
+    session_id = request.session_id or "anon"
+    try:
+        job = GEN_QUEUE.enqueue(session_id)
+    except QueueFull:
+        raise HTTPException(status_code=429, detail="Queue is full, please retry shortly")
 
-    triggers = db.query(PrankTrigger).filter(PrankTrigger.prank_id == prank.id).all()
-    prank.view_count = (prank.view_count or 0) + 1
-    db.commit()
+    GEN_QUEUE.wait_for_turn(job["generation_id"])
 
-    text_request = _build_text_request(
-        prompt=request.prompt,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        width=request.width,
-        height=request.height,
-        seed=request.seed,
-        engine=request.engine or "auto",
-        session_id=request.session_id,
-    )
-    if not triggers:
-        return _process_generation(text_request, db, share_slug=prank.share_slug)
+    try:
+        prank = _get_prank_by_slug(db, slug)
 
-    trap_texts = [t.trigger_text for t in triggers]
-    # Heuristic + optional LLM matcher
-    matcher_llm = get_prank_matcher_llm()
-    idx, debug = match_prank_trigger(request.prompt, trap_texts, llm=matcher_llm)
-    start_time = time.time()
-    logger.info(
-        "Prank match debug for slug=%s prompt=%r: %s",
-        slug,
-        request.prompt,
-        debug,
-    )
-
-    if idx is not None:
-        trigger = triggers[idx]
-        # Save a copy + thumbnail into generation storage for logging consistency.
-        try:
-            with Image.open(trigger.image_path) as prank_img:
-                image_path, thumb_path = save_generation_image(prank_img)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to load prank image for slug %s", slug)
-            raise HTTPException(status_code=500, detail="Failed to load prank image") from exc
-
-        trigger.match_count = (trigger.match_count or 0) + 1
+        triggers = db.query(PrankTrigger).filter(PrankTrigger.prank_id == prank.id).all()
+        prank.view_count = (prank.view_count or 0) + 1
         db.commit()
 
-        decision = RoutingDecision(
-            chosen_model_id="prank",
-            scores={"prank": 1.0},
-            tags=["prank"],
-            reason=f"Matched prank trigger: {trigger.trigger_text}",
-        )
-        generation_id = _log_generation(
-            db=db,
+        text_request = _build_text_request(
             prompt=request.prompt,
-            model_id="prank",
-            router_decision=decision,
-        image_path=image_path,
-        thumbnail_path=thumb_path,
-        prank_id=str(prank.id),
-        share_slug=prank.share_slug,
-        session_id=request.session_id,
-    )
+            num_inference_steps=request.num_inference_steps,
+            guidance_scale=request.guidance_scale,
+            width=request.width,
+            height=request.height,
+            seed=request.seed,
+            engine=request.engine or "auto",
+            session_id=request.session_id,
+        )
+        if not triggers:
+            resp = _process_generation(text_request, db, share_slug=prank.share_slug)
+            GEN_QUEUE.release(
+                job["generation_id"],
+                success=True,
+                payload={
+                    "image_base64": resp.image_base64,
+                    "model_used": resp.model_used or resp.model_id,
+                },
+            )
+            return resp
 
-        # Artificial delay to mimic generation time for prank hits.
-        _sleep_prank_delay()
-        total_ms = int((time.time() - start_time) * 1000)
-
-        return ImageResponse(
-            image_base64=load_prank_image_base64(trigger.image_path),
-            generation_id=generation_id,
-            model_id="prank",
-            model_used="prank",
-            thumbnail_base64=_encode_thumbnail_base64(thumb_path),
-            image_path=image_path,
-            thumbnail_path=thumb_path,
-            router_metadata=_routing_metadata(decision),
-            was_prank=True,
-            matched_trigger_id=str(trigger.id),
-            matched_trigger_text=trigger.trigger_text,
-            generation_time_ms=total_ms,
-            is_prank_match=True,
-            matched_trigger=MatchedTrigger(
-                id=str(trigger.id),
-                trigger_text=trigger.trigger_text,
-                image_base64=load_prank_image_base64(trigger.image_path),
-                thumbnail_base64=_encode_thumbnail_base64(trigger.thumbnail_path)
-                if trigger.thumbnail_path
-                else None,
-            ),
+        trap_texts = [t.trigger_text for t in triggers]
+        # Heuristic + optional LLM matcher
+        matcher_llm = get_prank_matcher_llm()
+        idx, debug = match_prank_trigger(request.prompt, trap_texts, llm=matcher_llm)
+        start_time = time.time()
+        logger.info(
+            "Prank match debug for slug=%s prompt=%r: %s",
+            slug,
+            request.prompt,
+            debug,
         )
 
-    resp = _process_generation(text_request, db, share_slug=prank.share_slug)
-    # Explicitly mark as non-prank when no trigger matched.
-    resp.is_prank_match = False
-    resp.matched_trigger = None
-    resp.matched_trigger_id = None
-    resp.matched_trigger_text = None
-    resp.was_prank = False
-    if resp.model_id and not resp.model_used:
-        resp.model_used = resp.model_id
-    return resp
+        if idx is not None:
+            trigger = triggers[idx]
+            # Save a copy + thumbnail into generation storage for logging consistency.
+            try:
+                with Image.open(trigger.image_path) as prank_img:
+                    image_path, thumb_path = save_generation_image(prank_img)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to load prank image for slug %s", slug)
+                raise HTTPException(status_code=500, detail="Failed to load prank image") from exc
+
+            trigger.match_count = (trigger.match_count or 0) + 1
+            db.commit()
+
+            decision = RoutingDecision(
+                chosen_model_id="prank",
+                scores={"prank": 1.0},
+                tags=["prank"],
+                reason=f"Matched prank trigger: {trigger.trigger_text}",
+            )
+            generation_id = _log_generation(
+                db=db,
+                prompt=request.prompt,
+                model_id="prank",
+                router_decision=decision,
+                image_path=image_path,
+                thumbnail_path=thumb_path,
+                prank_id=str(prank.id),
+                share_slug=prank.share_slug,
+                session_id=request.session_id,
+            )
+
+            # Artificial delay to mimic generation time for prank hits.
+            _sleep_prank_delay()
+            total_ms = int((time.time() - start_time) * 1000)
+
+            resp = ImageResponse(
+                image_base64=load_prank_image_base64(trigger.image_path),
+                generation_id=generation_id,
+                model_id="prank",
+                model_used="prank",
+                thumbnail_base64=_encode_thumbnail_base64(thumb_path),
+                image_path=image_path,
+                thumbnail_path=thumb_path,
+                router_metadata=_routing_metadata(decision),
+                was_prank=True,
+                matched_trigger_id=str(trigger.id),
+                matched_trigger_text=trigger.trigger_text,
+                generation_time_ms=total_ms,
+                is_prank_match=True,
+                matched_trigger=MatchedTrigger(
+                    id=str(trigger.id),
+                    trigger_text=trigger.trigger_text,
+                    image_base64=load_prank_image_base64(trigger.image_path),
+                    thumbnail_base64=_encode_thumbnail_base64(trigger.thumbnail_path)
+                    if trigger.thumbnail_path
+                    else None,
+                ),
+            )
+            GEN_QUEUE.release(
+                job["generation_id"],
+                success=True,
+                payload={
+                    "image_base64": resp.image_base64,
+                    "model_used": resp.model_used or resp.model_id,
+                },
+            )
+            return resp
+
+        resp = _process_generation(text_request, db, share_slug=prank.share_slug)
+        # Explicitly mark as non-prank when no trigger matched.
+        resp.is_prank_match = False
+        resp.matched_trigger = None
+        resp.matched_trigger_id = None
+        resp.matched_trigger_text = None
+        resp.was_prank = False
+        if resp.model_id and not resp.model_used:
+            resp.model_used = resp.model_id
+        GEN_QUEUE.release(
+            job["generation_id"],
+            success=True,
+            payload={
+                "image_base64": resp.image_base64,
+                "model_used": resp.model_used or resp.model_id,
+            },
+        )
+        return resp
+    except Exception as exc:  # noqa: BLE001
+        GEN_QUEUE.release(
+            job["generation_id"],
+            success=False,
+            payload={"error": str(exc)},
+        )
+        raise
 
 
 @app.patch("/api/pranks/{prank_id}/triggers/{trigger_id}", response_model=PrankTriggerCreateResponse)
@@ -1367,6 +1454,25 @@ def _file_media_type(path: Path) -> str:
     if suffix == ".webp":
         return "image/webp"
     return "application/octet-stream"
+
+
+@app.websocket("/ws/queue")
+async def queue_updates(websocket: WebSocket, sessionId: str | None = Query(None, alias="sessionId")):
+    """
+    WebSocket endpoint to stream queue updates for a session.
+    """
+    session_id = sessionId or "anon"
+    await websocket.accept()
+    GEN_QUEUE.hub.set_loop(asyncio.get_running_loop())
+    GEN_QUEUE.hub.register(session_id, websocket)
+    try:
+        while True:
+            try:
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+    finally:
+        GEN_QUEUE.hub.unregister(session_id, websocket)
 
 
 @app.get("/api/images/thumb/{generation_id}")

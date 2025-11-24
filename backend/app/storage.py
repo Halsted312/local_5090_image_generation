@@ -21,8 +21,8 @@ GEN_THUMB_ROOT = Path(os.getenv("GEN_THUMB_ROOT", BASE_DIR / "data" / "images" /
 GEN_IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
 GEN_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
 
-MAX_IMAGE_DIM = 2000
-MAX_IMAGE_BYTES = 3 * 1024 * 1024  # 3MB
+MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "512") or "512")
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(1 * 1024 * 1024)) or str(1 * 1024 * 1024))  # 1MB
 JPEG_QUALITY_START = 90
 JPEG_QUALITY_MIN = 70
 

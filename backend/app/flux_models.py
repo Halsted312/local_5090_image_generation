@@ -33,6 +33,22 @@ _logo_pipeline: HiDreamImagePipeline | StableDiffusionXLPipeline | None = None
 _lock = threading.Lock()
 
 
+def _disable_safety(pipe) -> None:
+    """
+    Disable safety checkers across pipelines to avoid NSFW filtering/black images.
+    """
+    try:
+        if hasattr(pipe, "safety_checker"):
+            pipe.safety_checker = None
+        if hasattr(pipe, "requires_safety_checker"):
+            pipe.requires_safety_checker = False
+        if hasattr(pipe, "feature_extractor"):
+            pipe.feature_extractor = None
+    except Exception:
+        # Best-effort; pipeline APIs differ by model/version.
+        pass
+
+
 def unload_all_models_except(keep_model: str = None):
     """Unload all models except the specified one to free GPU memory."""
     global _text_pipeline, _realvis_pipeline, _sd3_pipeline, _logo_pipeline
@@ -79,6 +95,7 @@ def _load_text_pipeline() -> FluxPipeline:
             torch_dtype=torch.bfloat16,
             token=token,
         )
+        _disable_safety(pipeline)
         try:
             pipeline.to(device)
         except torch.cuda.OutOfMemoryError:
@@ -116,6 +133,7 @@ def _load_realvis_pipeline() -> StableDiffusionXLPipeline:
         pipe = StableDiffusionXLPipeline.from_pretrained(
             REALVIS_MODEL_ID, torch_dtype=torch.bfloat16, token=token
         )
+        _disable_safety(pipe)
         try:
             pipe.to(device)
         except torch.cuda.OutOfMemoryError:
@@ -148,6 +166,7 @@ def _load_sd3_pipeline() -> StableDiffusion3Pipeline:
         pipe = StableDiffusion3Pipeline.from_pretrained(
             SD3_MODEL_ID, torch_dtype=torch.bfloat16, token=token
         )
+        _disable_safety(pipe)
         try:
             pipe.to(device)
         except torch.cuda.OutOfMemoryError:
@@ -238,13 +257,7 @@ def _load_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
             )
 
             # Disable safety checker for HiDream; logo/text prompts get blacked out otherwise.
-            try:
-                pipe.safety_checker = None
-                if hasattr(pipe, "requires_safety_checker"):
-                    pipe.requires_safety_checker = False
-                logger.info("HiDream safety checker disabled for logo/text generation")
-            except Exception:
-                logger.warning("Failed to disable safety checker on HiDream pipeline")
+            _disable_safety(pipe)
 
             # Force CPU offload for HiDream - it's too large for GPU
             if device == "cuda":
@@ -270,6 +283,7 @@ def _load_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
                 LOGO_SDXL_MODEL_ID, torch_dtype=torch.bfloat16, token=token
             )
 
+            _disable_safety(pipe)
             try:
                 pipe.to(device)
             except torch.cuda.OutOfMemoryError:

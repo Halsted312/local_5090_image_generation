@@ -53,12 +53,11 @@ services:
       - .env
     environment:
       - GPU_COORD_PATH=/gpu_coord/status.json
-      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
+      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN:-}
       - HF_HUB_ENABLE_HF_TRANSFER=1
-      - HF_HOME=/workspace/hf_cache
     volumes:
       - gpu-coord:/gpu_coord
-      - hf_cache:/workspace/hf_cache
+      - hf_cache:/root/.cache/huggingface
       - ./research:/workspace/research:ro
       - ./research/benchmark_results:/workspace/benchmark_results
     command: ["python", "research/benchmarks/efficient_benchmark_runner.py"]

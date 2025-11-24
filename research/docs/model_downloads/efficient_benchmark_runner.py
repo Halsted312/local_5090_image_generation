@@ -166,9 +166,8 @@ class QuickLightningBenchmark:
         self.clip_model = None
         self.clip_preprocess = None
         self.clip_tokenizer = None
-        # Sweep a broader set of steps and TF32 on/off by default.
-        self.steps_options = steps_options or [4, 8, 16, 24, 32, 40, 48]
-        self.tf32_options = tf32_options or [True, False]
+        self.steps_options = steps_options or [4]
+        self.tf32_options = tf32_options or [True]
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def _load_models(self) -> None:
@@ -237,24 +236,22 @@ class QuickLightningBenchmark:
                         gen = self.pipeline(
                             prompt=prompt_text,
                             num_inference_steps=steps,
-                            guidance_scale=1.0,
-                            width=256,
-                            height=256,
+                            guidance_scale=0.0,
+                            width=512,
+                            height=512,
                             generator=torch.Generator(device=self.device).manual_seed(seed),
                         )
                         image = gen.images[0]
                         gen_ms = (time.perf_counter() - start_time) * 1000.0
-                        vram_peak_mb = 0.0
-                        vram_alloc_mb = 0.0
+                        vram_mb = 0.0
                         try:
-                            vram_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-                            vram_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                            vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                         except Exception:
                             pass
-                        return image, gen_ms, vram_peak_mb, vram_alloc_mb
+                        return image, gen_ms, vram_mb
 
                     with self.lease:
-                        image, gen_ms, vram_peak_mb, vram_alloc_mb = _generate_one()
+                        image, gen_ms, vram_mb = _generate_one()
 
                     clip_score = self._clip_score(image, prompt_text)
                     aesthetic_score = self._aesthetic_score(image)
@@ -279,11 +276,10 @@ class QuickLightningBenchmark:
                         "resolution_w": 512,
                         "resolution_h": 512,
                         "steps": steps,
-                        "guidance": 1.0,
-                        "vram_peak_mb": vram_peak_mb,
-                        "vram_alloc_mb": vram_alloc_mb,
+                        "guidance": 0.0,
                         "tf32_enabled": use_tf32,
                         "gen_ms": gen_ms,
+                        "vram_peak_mb": vram_mb,
                         "clip_score": clip_score,
                         "aesthetic_score": aesthetic_score,
                         "image_path": str(image_path) if image_path else None,
@@ -303,13 +299,13 @@ class MultiModelSweep:
     """
 
     MODEL_REGISTRY = {
-        "sdxl_turbo": {"name": "SDXL-Turbo", "repo": "stabilityai/sdxl-turbo", "guidance": 1.0, "type": "auto"},
-        "flux_dev": {"name": "FLUX.1-dev", "repo": "black-forest-labs/FLUX.1-dev", "guidance": 1.0, "type": "flux"},
-        "realvis_xl": {"name": "RealVisXL", "repo": "SG161222/RealVisXL_V4.0", "guidance": 1.0, "type": "auto"},
-        "sd3_medium": {"name": "SD3 Medium", "repo": "stabilityai/stable-diffusion-3-medium", "guidance": 1.0, "type": "auto"},
-        "sdxl": {"name": "SDXL 1.0", "repo": "stabilityai/stable-diffusion-xl-base-1.0", "guidance": 1.0, "type": "auto"},
-        "hidream": {"name": "HiDream-I1", "repo": "HiDream-ai/HiDream-I1-Full", "guidance": 1.0, "type": "auto"},
-        "deepfloyd": {"name": "DeepFloyd IF", "repo": "DeepFloyd/IF-I-XL-v1.0", "guidance": 1.0, "type": "if"},
+        "sdxl_turbo": {"name": "SDXL-Turbo", "repo": "stabilityai/sdxl-turbo", "guidance": 0.0},
+        "flux_dev": {"name": "FLUX.1-dev", "repo": "black-forest-labs/FLUX.1-dev", "guidance": 4.5},
+        "realvis_xl": {"name": "RealVisXL", "repo": "SG161222/RealVisXL_V4.0", "guidance": 5.5},
+        "sd3_medium": {"name": "SD3 Medium", "repo": "stabilityai/stable-diffusion-3-medium", "guidance": 6.5},
+        "sdxl": {"name": "SDXL 1.0", "repo": "stabilityai/stable-diffusion-xl-base-1.0", "guidance": 7.0},
+        "hidream": {"name": "HiDream-I1", "repo": "HiDream-ai/HiDream-I1-Full", "guidance": 4.0},
+        "deepfloyd": {"name": "DeepFloyd IF", "repo": "DeepFloyd/IF-I-XL-v1.0", "guidance": 6.0},
     }
 
     def __init__(
@@ -360,32 +356,16 @@ class MultiModelSweep:
         except Exception:
             return None
 
-    def _load_pipeline(self, repo_id: str, model_type: str):
-        if model_type == "flux":
-            pipe = FluxPipeline.from_pretrained(
-                repo_id,
-                torch_dtype=torch.float16,
-                cache_dir=os.environ.get("HF_HOME"),
-                token=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-            ).to(self.device)
-        elif model_type == "if":
-            pipe = DiffusionPipeline.from_pretrained(
-                repo_id,
-                torch_dtype=torch.float16,
-                variant="fp16",
-                cache_dir=os.environ.get("HF_HOME"),
-                token=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-            ).to(self.device)
-        else:
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                repo_id,
-                torch_dtype=torch.float16,
-                use_safetensors=True,
-                cache_dir=os.environ.get("HF_HOME"),
-                token=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-            ).to(self.device)
-        if hasattr(pipe, "set_progress_bar_config"):
-            pipe.set_progress_bar_config(disable=True)
+    def _load_pipeline(self, repo_id: str):
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            repo_id,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True,
+            cache_dir=os.environ.get("HF_HOME"),
+            token=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+        ).to(self.device)
+        pipe.set_progress_bar_config(disable=True)
         return pipe
 
     def run(self, seed: int = 42) -> Path:
@@ -397,8 +377,7 @@ class MultiModelSweep:
             model_name = cfg["name"]
             repo = cfg["repo"]
             guidance = cfg["guidance"]
-            model_type = cfg.get("type", "auto")
-            pipe = self._load_pipeline(repo, model_type)
+            pipe = self._load_pipeline(repo)
 
             for prompt_obj in tqdm(self.prompts, desc=f"{model_name}"):
                 prompt_text = prompt_obj["prompt"]
@@ -429,17 +408,15 @@ class MultiModelSweep:
                             )
                             image = gen.images[0]
                             gen_ms = (time.perf_counter() - start_time) * 1000.0
-                            vram_peak_mb = 0.0
-                            vram_alloc_mb = 0.0
+                            vram_mb = 0.0
                             try:
-                                vram_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-                                vram_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                                vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                             except Exception:
                                 pass
-                            return image, gen_ms, vram_peak_mb, vram_alloc_mb
+                            return image, gen_ms, vram_mb
 
                         with self.lease:
-                            image, gen_ms, vram_peak_mb, vram_alloc_mb = _generate_one()
+                            image, gen_ms, vram_mb = _generate_one()
 
                         clip_score = self._clip_score(image, prompt_text)
                         aesthetic_score = self._aesthetic_score(image)
@@ -467,8 +444,7 @@ class MultiModelSweep:
                             "guidance": guidance,
                             "tf32_enabled": use_tf32,
                             "gen_ms": gen_ms,
-                            "vram_peak_mb": vram_peak_mb,
-                            "vram_alloc_mb": vram_alloc_mb,
+                            "vram_peak_mb": vram_mb,
                             "clip_score": clip_score,
                             "aesthetic_score": aesthetic_score,
                             "image_path": str(image_path) if image_path else None,
