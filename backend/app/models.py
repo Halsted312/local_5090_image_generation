@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, Index
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, Index, Float
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -70,3 +70,39 @@ class GenerationLog(Base):
     share_slug = Column(String(16), nullable=True)
     session_id = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class GenerationMetric(Base):
+    """
+    Detailed timing and parameter capture for latency distribution studies.
+    Separate from GenerationLog to avoid changing existing consumer logic.
+    """
+
+    __tablename__ = "generation_metrics"
+    __table_args__ = (
+        Index("idx_metrics_model_time", "model_used", "started_at"),
+        Index("idx_metrics_started", "started_at"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    prompt = Column(Text, nullable=False)
+    prompt_length = Column(Integer, nullable=False)
+    model_used = Column(String(50), nullable=False)
+    engine_requested = Column(String(50), nullable=True)
+    num_inference_steps = Column(Integer, nullable=True)
+    guidance_scale = Column(Float, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    seed = Column(Integer, nullable=True)
+    tf32_enabled = Column(Boolean, nullable=True)
+    is_synthetic = Column(Boolean, nullable=False, default=False)
+    is_prank = Column(Boolean, nullable=False, default=False)
+    queue_position_at_start = Column(Integer, nullable=True)
+    queue_wait_ms = Column(Integer, nullable=True)
+    duration_ms = Column(Integer, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    ended_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    router_json = Column(Text, nullable=True)
+    session_id = Column(String(100), nullable=True)
+    share_slug = Column(String(16), nullable=True)
+    prompt_metadata = Column(Text, nullable=True)  # e.g., benchmark ids/categories

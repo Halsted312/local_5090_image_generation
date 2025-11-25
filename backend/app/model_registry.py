@@ -20,10 +20,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, object]] = {
         "tags": ["complex", "text", "ui"],
         "notes": "Complex scenes, posters, UI, better typography.",
     },
-    "logo_sdxl": {
-        "display_name": "HiDream I1 (Text & Logos)",
+    "hidream_dev": {
+        "display_name": "HiDream I1 Dev (Text & Logos)",
         "tags": ["logo", "icon", "text", "prompt-following"],
-        "notes": "17B HiDream-I1-Full, superior text rendering and logo generation.",
+        "notes": "HiDream-I1-Dev (lighter) for text rendering and logos.",
     },
 }
 

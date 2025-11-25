@@ -27,7 +27,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-ImageModelId = str  # Expected: "flux_dev", "realvis_xl", "sd3_medium", "logo_sdxl"
+ImageModelId = str  # Expected: "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev"
+EXCLUDED_MODELS: set[str] = set(
+    m.strip()
+    for m in os.getenv("EXCLUDED_LIVE_MODELS", "").split(",")
+    if m.strip()
+)
 
 
 @dataclass
@@ -207,7 +212,7 @@ def score_models_for_prompt(
     scores["flux_dev"] = 0.6
     scores["realvis_xl"] = 0.2
     scores["sd3_medium"] = 0.1
-    scores["logo_sdxl"] = 0.1
+    scores["hidream_dev"] = 0.1
 
     # 1. Portrait / human photo
     has_portrait = _contains_any(p, PORTRAIT_WORDS)
@@ -225,7 +230,7 @@ def score_models_for_prompt(
         scores["realvis_xl"] += 0.6
         scores["flux_dev"] += 0.2
         scores["sd3_medium"] -= 0.1
-        scores["logo_sdxl"] -= 0.2
+        scores["hidream_dev"] -= 0.2
     elif has_human or has_portrait:
         scores["realvis_xl"] += 0.3
         scores["flux_dev"] += 0.3
@@ -243,7 +248,7 @@ def score_models_for_prompt(
         tags.append("ui_layout")
 
     if has_logo:
-        scores["logo_sdxl"] += 0.7
+        scores["hidream_dev"] += 0.7
         scores["sd3_medium"] += 0.3
         scores["realvis_xl"] -= 0.2
     if has_text_layout or has_ui_layout:
@@ -281,10 +286,12 @@ def score_models_for_prompt(
         scores[k] /= total
 
     # 6. Choose model with tie-break preference
-    ordered_ids = ["realvis_xl", "logo_sdxl", "sd3_medium", "flux_dev"]
+    ordered_ids = ["realvis_xl", "hidream_dev", "sd3_medium", "flux_dev"]
     best_id = None
     best_score = -1.0
     for mid in ordered_ids:
+        if mid in EXCLUDED_MODELS:
+            continue
         s = scores[mid]
         if s > best_score:
             best_score = s
@@ -321,21 +328,21 @@ You are an "image model router". Decide which ONE engine to use:
 - flux_dev: general-purpose, strong prompt following.
 - realvis_xl: photorealistic faces/people.
 - sd3_medium: complex prompts, text inside image, posters/UI.
-- logo_sdxl: HiDream I1 - superior text rendering, logos/wordmarks with readable text.
+- hidream_dev: HiDream I1 Dev - text rendering, logos/wordmarks with readable text.
 
 Rules:
 1) If human/portrait + photo language -> realvis_xl >= 0.85, flux_dev secondary.
-2) If logo/icon/branding/wordmark -> logo_sdxl >= 0.8; especially if text must be readable.
-3) If posters/UI/text layout -> sd3_medium >= 0.8; logo_sdxl if text clarity critical.
+2) If logo/icon/branding/wordmark -> hidream_dev >= 0.8; especially if text must be readable.
+3) If posters/UI/text layout -> sd3_medium >= 0.8; hidream_dev if text clarity critical.
 4) If long/complex multi-clause -> boost sd3_medium and flux_dev.
 5) Stylized/cartoon -> flux_dev highest.
 6) Landscapes without portraits/logos -> flux_dev preferred.
-7) Tie-break: portraits -> realvis_xl; logos/text -> logo_sdxl; complex -> sd3_medium; else flux_dev.
+7) Tie-break: portraits -> realvis_xl; logos/text -> hidream_dev; complex -> sd3_medium; else flux_dev.
 
 Output ONLY JSON:
 {
-  "chosen_model_id": "<flux_dev|realvis_xl|sd3_medium|logo_sdxl>",
-  "scores": {"flux_dev":0.0,"realvis_xl":0.0,"sd3_medium":0.0,"logo_sdxl":0.0},
+  "chosen_model_id": "<flux_dev|realvis_xl|sd3_medium|hidream_dev>",
+  "scores": {"flux_dev":0.0,"realvis_xl":0.0,"sd3_medium":0.0,"hidream_dev":0.0},
   "tags": ["portrait","logo",...],
   "reason": "short explanation"
 }
@@ -458,6 +465,17 @@ def route_prompt(prompt: str, confidence_gap: float = 0.2, min_confidence: float
     try:
         llm_decision = route_with_llm(prompt, heuristic_scores=scores, heuristic_tags=tags)
         if llm_decision:
+            if llm_decision.chosen_model_id in EXCLUDED_MODELS:
+                # Fallback to best non-excluded heuristic
+                filtered = [(mid, sc) for mid, sc in scores.items() if mid not in EXCLUDED_MODELS]
+                filtered = sorted(filtered, key=lambda kv: kv[1], reverse=True)
+                fallback_id = filtered[0][0] if filtered else best_id
+                return RoutingDecision(
+                    chosen_model_id=fallback_id,
+                    scores=scores,
+                    tags=tags,
+                    reason=f"LLM chose excluded model; fallback to heuristic {fallback_id}",
+                )
             return llm_decision
     except Exception as exc:  # noqa: BLE001
         logger.warning("Routing LLM failure, using heuristic fallback: %s", exc)

@@ -12,13 +12,14 @@ class TextGenerateRequest(BaseModel):
     prompt: str = Field(..., description="Text prompt for FLUX generation")
     num_inference_steps: int = Field(4, ge=1, le=50)
     guidance_scale: float = Field(0.0, ge=0.0, le=50.0)
-    width: int = Field(1024, ge=256, le=2048)
-    height: int = Field(1024, ge=256, le=2048)
+    width: int = Field(768, ge=256, le=2048)
+    height: int = Field(768, ge=256, le=2048)
     seed: int | None = Field(None, description="Optional RNG seed for reproducibility")
-    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "logo_sdxl"] = Field(
+    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev"] = Field(
         "auto", description="Engine override; 'auto' uses router"
     )
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
+    benchmark_meta: dict | None = Field(None, alias="benchmarkMeta", description="Optional benchmark metadata blob")
 
 class RoutingMetadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -44,6 +45,12 @@ class ImageResponse(BaseModel):
     generation_id: str | None = None
     model_id: str | None = None
     model_used: str | None = None
+    image_url: str | None = Field(None, alias="imageUrl")
+    prompt: str | None = None
+    processing_time_ms: int | None = Field(None, alias="processingTimeMs")
+    queue_wait_ms: int | None = Field(None, alias="queueWaitMs")
+    distribution: list[int] | None = None
+    distribution_all: list[int] | None = Field(None, alias="distributionAll")
     was_prank: bool | None = Field(None, alias="was_prank", serialization_alias="wasPrank")
     matched_trigger_id: str | None = Field(None, alias="matched_trigger_id", serialization_alias="matched_trigger_id")
     matched_trigger_text: str | None = Field(
@@ -102,7 +109,7 @@ class PrankGenerateRequest(BaseModel):
     height: int | None = Field(None, ge=256, le=2048)
     seed: int | None = Field(None, description="Optional RNG seed for prank generation")
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
-    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "logo_sdxl"] | None = Field(
+    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev"] | None = Field(
         None, alias="engine", description="Engine override; defaults to auto"
     )
 

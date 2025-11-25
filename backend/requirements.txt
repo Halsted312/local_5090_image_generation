@@ -13,3 +13,4 @@ hf-transfer
 sqlalchemy
 psycopg2-binary
 torch>=2.0.0
+requests

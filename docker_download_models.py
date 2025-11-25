@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 MODELS = [
     "stabilityai/sdxl-turbo",                          # Public - SDXL Turbo
     "black-forest-labs/FLUX.1-dev",                    # GATED - Accept at https://huggingface.co/black-forest-labs/FLUX.1-dev
-    "SG161222/RealVisXL_V4.0",                        # Public - RealVisXL V4
+    "SG161222/RealVisXL_V4.0",                         # Public - RealVisXL V4
     "stabilityai/stable-diffusion-3-medium",           # GATED - Accept at https://huggingface.co/stabilityai/stable-diffusion-3-medium  
     "stabilityai/stable-diffusion-xl-base-1.0",        # Public - SDXL Base
-    "HiDream-ai/HiDream-I1-Full",                     # Public - HiDream
+    "HiDream-ai/HiDream-I1-Dev",                       # HiDream lightweight dev version
     "DeepFloyd/IF-I-XL-v1.0",                         # GATED - Accept at https://huggingface.co/DeepFloyd/IF-I-XL-v1.0
     "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",       # Public - For CLIP scores
 ]

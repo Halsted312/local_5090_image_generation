@@ -88,6 +88,7 @@ class GenerationQueue:
                 "generation_id": uuid.uuid4().hex,
                 "session_id": session_id,
                 "enqueued_at": time.time(),
+                "queue_position": len(self._queue),
             }
             self._queue.append(job)
             position = len(self._queue) - 1

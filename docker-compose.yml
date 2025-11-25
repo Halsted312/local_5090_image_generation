@@ -22,6 +22,7 @@ services:
       - PRANK_LLM_ID=${PRANK_LLM_ID:-meta-llama/Meta-Llama-3-8B-Instruct}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
       - GPU_COORD_PATH=/gpu_coord/status.json
+      - EXCLUDED_LIVE_MODELS=${EXCLUDED_LIVE_MODELS:-hidream_dev}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./prank_images:/data/prank_images

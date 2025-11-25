@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Iterable
 import asyncio
+from datetime import datetime, timezone
 
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
@@ -31,11 +32,12 @@ from .flux_models import (
     get_sd3_pipeline,
     get_text_pipeline,
 )
-from .models import GenerationLog, Prank, PrankTrigger
+from .models import GenerationLog, GenerationMetric, Prank, PrankTrigger
 from .prank_matching import get_prank_matcher_llm, match_prank_trigger
 from .model_registry import MODEL_REGISTRY
 from .router_engine import RoutingDecision, route_prompt
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from .metrics import get_percentiles, clear_cache
 from .schemas import (
     ImageResponse,
     PrankCreateResponse,
@@ -79,6 +81,7 @@ ADMIN_TOKEN_ISSUED = time.time()
 ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", str(24 * 3600)) or str(24 * 3600))
 ADMIN_LOGIN_WINDOW = int(os.getenv("ADMIN_LOGIN_WINDOW", "60") or "60")
 ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "10") or "10")
+PERCENTILE_CACHE_TTL_SECONDS = int(os.getenv("PERCENTILE_CACHE_TTL_SECONDS", "300") or "300")
 REWRITE_MODEL_ID = os.getenv("REWRITE_LLM_ID", os.getenv("ROUTER_LLM_ID", "Qwen/Qwen2.5-1.5B-Instruct"))
 _rewrite_pipeline = None
 _rewrite_lock = threading.Lock()
@@ -111,9 +114,9 @@ GEN_QUEUE = GenerationQueue(capacity=GEN_QUEUE_CAPACITY)
 # Fast, model-specific preset steps/guidance (ignore frontend sliders for speed).
 MODEL_PRESETS: dict[str, dict[str, float]] = {
     "flux_dev": {"steps": 4, "guidance": 0.0},
-    "realvis_xl": {"steps": 8, "guidance": 2.0},
-    "sd3_medium": {"steps": 18, "guidance": 6.5},
-    "logo_sdxl": {"steps": 20, "guidance": 4.5},
+    "realvis_xl": {"steps": 22, "guidance": 3.5},
+    "sd3_medium": {"steps": 26, "guidance": 7.0},
+    "hidream_dev": {"steps": 28, "guidance": 1.0},
 }
 
 
@@ -377,6 +380,13 @@ def _is_black_image(image: Image.Image, threshold: int = 2) -> bool:
     return extrema[1] <= threshold
 
 
+def _tf32_enabled() -> bool | None:
+    try:
+        return bool(getattr(torch.backends.cuda.matmul, "allow_tf32", None))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def require_admin(x_admin_token: str = Header(..., alias="X-Admin-Token")) -> None:
     # Expire tokens after TTL; force re-login.
     if (time.time() - ADMIN_TOKEN_ISSUED) > ADMIN_TOKEN_TTL_SECONDS:
@@ -463,7 +473,7 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
         pipe = get_realvis_pipeline()
     elif model_id == "sd3_medium":
         pipe = get_sd3_pipeline()
-    elif model_id == "logo_sdxl":
+    elif model_id == "hidream_dev":
         pipe = get_logo_pipeline()
     else:
         logger.warning("Model %s not implemented; falling back to flux_dev", model_id)
@@ -471,7 +481,7 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
         selected = "flux_dev"
 
     # Use HiDream-specific defaults when logo_sdxl is selected
-    if model_id == "logo_sdxl":
+    if model_id == "hidream_dev":
         from .config import HIDREAM_STEPS, HIDREAM_GUIDANCE
         num_steps = request.num_inference_steps or HIDREAM_STEPS
         guidance = request.guidance_scale if request.guidance_scale is not None else HIDREAM_GUIDANCE
@@ -544,7 +554,7 @@ def _execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.I
                             image = result.images[0]
         except Exception as exc:  # noqa: BLE001
             # If HiDream/logo path fails, fall back to flux_dev to return something instead of 500.
-            if model_id == "logo_sdxl":
+            if model_id == "hidream_dev":
                 logger.exception("Logo/HiDream generation failed, falling back to flux_dev")
                 try:
                     pipe = get_text_pipeline()
@@ -601,6 +611,60 @@ def _log_generation(
     db.refresh(log_entry)
     return str(log_entry.id)
 
+
+def _record_metric(
+    db: Session,
+    *,
+    prompt: str,
+    model_used: str,
+    engine_requested: str | None,
+    num_steps: int | None,
+    guidance: float | None,
+    width: int | None,
+    height: int | None,
+    seed: int | None,
+    tf32_enabled: bool | None,
+    is_synthetic: bool,
+    is_prank: bool,
+    queue_position: int | None,
+    queue_wait_ms: int | None,
+    duration_ms: int,
+    started_at: datetime,
+    ended_at: datetime,
+    router_json: dict | None,
+    session_id: str | None,
+    share_slug: str | None,
+    prompt_metadata: dict | None = None,
+) -> None:
+    """
+    Persist a detailed metric row for latency/distribution analysis.
+    """
+    metric = GenerationMetric(
+        prompt=prompt,
+        prompt_length=len(prompt),
+        model_used=model_used,
+        engine_requested=engine_requested,
+        num_inference_steps=num_steps,
+        guidance_scale=guidance,
+        width=width,
+        height=height,
+        seed=seed,
+        tf32_enabled=tf32_enabled,
+        is_synthetic=is_synthetic,
+        is_prank=is_prank,
+        queue_position_at_start=queue_position,
+        queue_wait_ms=queue_wait_ms,
+        duration_ms=duration_ms,
+        started_at=started_at,
+        ended_at=ended_at,
+        router_json=json.dumps(router_json) if router_json else None,
+        session_id=session_id,
+        share_slug=share_slug,
+        prompt_metadata=json.dumps(prompt_metadata) if prompt_metadata else None,
+    )
+    db.add(metric)
+    db.commit()
+    clear_cache()
 
 def _encode_thumbnail_base64(thumb_path: str) -> str | None:
     try:
@@ -744,6 +808,7 @@ async def generate_options() -> Response:
 @app.post("/api/generate", response_model=ImageResponse)
 def generate_image(
     request: TextGenerateRequest,
+    x_benchmark_run: str | None = Header(None, alias="X-Benchmark-Run"),
     db: Session = Depends(get_db),
 ) -> ImageResponse:
     session_id = request.session_id or "anon"
@@ -754,9 +819,13 @@ def generate_image(
 
     # Block until this job reaches the front of the queue.
     GEN_QUEUE.wait_for_turn(job["generation_id"])
+    queue_wait_ms = int((time.time() - job["enqueued_at"]) * 1000)
+    queue_position = job.get("queue_position")
 
     try:
+        processing_started_at = datetime.now(timezone.utc)
         resp = _process_generation(request, db)
+        processing_finished_at = datetime.now(timezone.utc)
         GEN_QUEUE.release(
             job["generation_id"],
             success=True,
@@ -765,6 +834,50 @@ def generate_image(
                 "model_used": resp.model_used or resp.model_id,
             },
         )
+        resp.queue_wait_ms = queue_wait_ms
+        resp.processing_time_ms = resp.generation_time_ms
+        resp.prompt = request.prompt
+        resp.image_url = resp.image_path
+
+        model_for_distribution = resp.model_used or resp.model_id
+        # Persist metrics (skip if model missing)
+        if model_for_distribution:
+            duration_ms = resp.generation_time_ms or int(
+                (processing_finished_at - processing_started_at).total_seconds() * 1000
+            )
+            is_synthetic = (x_benchmark_run or "").lower() in {"1", "true", "yes"}
+            try:
+                _record_metric(
+                    db,
+                    prompt=request.prompt,
+                    model_used=model_for_distribution,
+                    engine_requested=request.engine,
+                    num_steps=request.num_inference_steps,
+                    guidance=request.guidance_scale,
+                    width=request.width,
+                    height=request.height,
+                    seed=request.seed,
+                    tf32_enabled=_tf32_enabled(),
+                    is_synthetic=is_synthetic,
+                    is_prank=False,
+                    queue_position=queue_position,
+                    queue_wait_ms=queue_wait_ms,
+                    duration_ms=duration_ms,
+                    started_at=processing_started_at,
+                    ended_at=processing_finished_at,
+                    router_json=resp.router_metadata.model_dump() if resp.router_metadata else None,
+                    session_id=request.session_id,
+                    share_slug=None,
+                    prompt_metadata=request.benchmark_meta,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to record generation metric: %s", exc)
+        # Attach percentile distributions (per model and all models) after recording
+        try:
+            resp.distribution, _ = get_percentiles(db, model_for_distribution, cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+            resp.distribution_all, _ = get_percentiles(db, "all", cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to compute distributions: %s", exc)
         return resp
     except Exception as exc:  # noqa: BLE001
         GEN_QUEUE.release(
@@ -1052,6 +1165,7 @@ def add_prank_trigger_by_slug(
 def generate_prank_image(
     slug: str,
     request: PrankGenerateRequest,
+    x_benchmark_run: str | None = Header(None, alias="X-Benchmark-Run"),
     db: Session = Depends(get_db),
 ) -> ImageResponse:
     session_id = request.session_id or "anon"
@@ -1061,6 +1175,8 @@ def generate_prank_image(
         raise HTTPException(status_code=429, detail="Queue is full, please retry shortly")
 
     GEN_QUEUE.wait_for_turn(job["generation_id"])
+    queue_wait_ms = int((time.time() - job["enqueued_at"]) * 1000)
+    queue_position = job.get("queue_position")
 
     try:
         prank = _get_prank_by_slug(db, slug)
@@ -1080,7 +1196,9 @@ def generate_prank_image(
             session_id=request.session_id,
         )
         if not triggers:
+            processing_started_at = datetime.now(timezone.utc)
             resp = _process_generation(text_request, db, share_slug=prank.share_slug)
+            processing_finished_at = datetime.now(timezone.utc)
             GEN_QUEUE.release(
                 job["generation_id"],
                 success=True,
@@ -1089,6 +1207,47 @@ def generate_prank_image(
                     "model_used": resp.model_used or resp.model_id,
                 },
             )
+            resp.queue_wait_ms = queue_wait_ms
+            resp.processing_time_ms = resp.generation_time_ms
+            resp.prompt = request.prompt
+            resp.image_url = resp.image_path
+            model_for_distribution = resp.model_used or resp.model_id
+            if model_for_distribution and model_for_distribution != "prank":
+                duration_ms = resp.generation_time_ms or int(
+                    (processing_finished_at - processing_started_at).total_seconds() * 1000
+                )
+                is_synthetic = (x_benchmark_run or "").lower() in {"1", "true", "yes"}
+                try:
+                    _record_metric(
+                        db,
+                        prompt=request.prompt,
+                        model_used=model_for_distribution,
+                        engine_requested=request.engine or "auto",
+                        num_steps=text_request.num_inference_steps,
+                        guidance=text_request.guidance_scale,
+                        width=text_request.width,
+                        height=text_request.height,
+                        seed=text_request.seed,
+                        tf32_enabled=_tf32_enabled(),
+                        is_synthetic=is_synthetic,
+                        is_prank=False,
+                        queue_position=queue_position,
+                        queue_wait_ms=queue_wait_ms,
+                        duration_ms=duration_ms,
+                        started_at=processing_started_at,
+                        ended_at=processing_finished_at,
+                        router_json=resp.router_metadata.model_dump() if resp.router_metadata else None,
+                        session_id=request.session_id,
+                        share_slug=prank.share_slug,
+                        prompt_metadata=None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to record generation metric (prank no-trigger): %s", exc)
+            try:
+                resp.distribution, _ = get_percentiles(db, model_for_distribution, cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+                resp.distribution_all, _ = get_percentiles(db, "all", cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to compute distributions: %s", exc)
             return resp
 
         trap_texts = [t.trigger_text for t in triggers]
@@ -1169,9 +1328,15 @@ def generate_prank_image(
                     "model_used": resp.model_used or resp.model_id,
                 },
             )
+            resp.queue_wait_ms = queue_wait_ms
+            resp.processing_time_ms = resp.generation_time_ms
+            resp.prompt = request.prompt
+            resp.image_url = resp.image_path
             return resp
 
+        processing_started_at = datetime.now(timezone.utc)
         resp = _process_generation(text_request, db, share_slug=prank.share_slug)
+        processing_finished_at = datetime.now(timezone.utc)
         # Explicitly mark as non-prank when no trigger matched.
         resp.is_prank_match = False
         resp.matched_trigger = None
@@ -1180,6 +1345,47 @@ def generate_prank_image(
         resp.was_prank = False
         if resp.model_id and not resp.model_used:
             resp.model_used = resp.model_id
+        resp.queue_wait_ms = queue_wait_ms
+        resp.processing_time_ms = resp.generation_time_ms
+        resp.prompt = request.prompt
+        resp.image_url = resp.image_path
+        model_for_distribution = resp.model_used or resp.model_id
+        if model_for_distribution and model_for_distribution != "prank":
+            duration_ms = resp.generation_time_ms or int(
+                (processing_finished_at - processing_started_at).total_seconds() * 1000
+            )
+            is_synthetic = (x_benchmark_run or "").lower() in {"1", "true", "yes"}
+            try:
+                _record_metric(
+                    db,
+                    prompt=request.prompt,
+                    model_used=model_for_distribution,
+                    engine_requested=request.engine or "auto",
+                    num_steps=text_request.num_inference_steps,
+                    guidance=text_request.guidance_scale,
+                    width=text_request.width,
+                    height=text_request.height,
+                    seed=text_request.seed,
+                    tf32_enabled=_tf32_enabled(),
+                    is_synthetic=is_synthetic,
+                    is_prank=False,
+                    queue_position=queue_position,
+                    queue_wait_ms=queue_wait_ms,
+                    duration_ms=duration_ms,
+                    started_at=processing_started_at,
+                    ended_at=processing_finished_at,
+                    router_json=resp.router_metadata.model_dump() if resp.router_metadata else None,
+                    session_id=request.session_id,
+                    share_slug=prank.share_slug,
+                    prompt_metadata=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to record generation metric (prank no match): %s", exc)
+        try:
+            resp.distribution, _ = get_percentiles(db, model_for_distribution, cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+            resp.distribution_all, _ = get_percentiles(db, "all", cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to compute distributions: %s", exc)
         GEN_QUEUE.release(
             job["generation_id"],
             success=True,
@@ -1443,6 +1649,25 @@ def list_generations(
         )
         for r in rows
     ]
+
+
+@app.get("/api/metrics/distribution")
+def metrics_distribution(
+    model_id: str = Query("all", alias="modelId"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return latency percentiles (p5..p100) for the given model over the last 30 days.
+    Cached for ~5 minutes to avoid heavy DB scans.
+    """
+    model_key = None if model_id in (None, "", "all") else model_id
+    distribution, count = get_percentiles(db, model_key, cache_ttl_seconds=PERCENTILE_CACHE_TTL_SECONDS)
+    return {
+        "modelId": model_id if model_key else "all",
+        "distribution": distribution,
+        "count": count,
+        "asOf": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _file_media_type(path: Path) -> str:

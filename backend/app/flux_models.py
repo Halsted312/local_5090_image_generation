@@ -196,10 +196,10 @@ def _load_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
     try:
         # Check if we're using HiDream model
         if "HiDream" in LOGO_SDXL_MODEL_ID:
-            logger.info("Initializing HiDream-I1-Full pipeline with Llama text encoder")
+            logger.info("Initializing HiDream pipeline with Llama text encoder")
 
             # CRITICAL: Unload all other models to make room for HiDream
-            logger.info("Unloading other models to make room for HiDream (17B params)")
+            logger.info("Unloading other models to make room for HiDream (large params)")
             unload_all_models_except("logo")
 
             # Clear CUDA cache before loading
