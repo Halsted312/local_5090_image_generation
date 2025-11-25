@@ -689,14 +689,14 @@ def _process_generation(
     start = time.time()
     if request.engine == "auto":
         decision = route_prompt(request.prompt)
-        chosen_model = decision.chosen_model_id
+        chosen_model = "flux_dev"
     else:
-        chosen_model = request.engine
+        chosen_model = "flux_dev"
         decision = RoutingDecision(
             chosen_model_id=chosen_model,
             scores={chosen_model: 1.0},
             tags=["manual"],
-            reason="Manual engine override",
+            reason="Forced flux_dev",
         )
 
     # Override steps/guidance with fast presets per model to ignore frontend sliders.
