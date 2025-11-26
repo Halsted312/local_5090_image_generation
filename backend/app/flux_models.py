@@ -98,9 +98,13 @@ def _load_text_pipeline() -> FluxPipeline:
         _disable_safety(pipeline)
         try:
             pipeline.to(device)
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("Text pipeline OOM on GPU; enabling CPU offload.")
-            pipeline.enable_model_cpu_offload()
+        except Exception as exc:
+            logger.warning("Text pipeline load to device failed (%s); enabling CPU offload.", exc)
+            try:
+                pipeline.enable_model_cpu_offload()
+            except Exception:
+                logger.warning("CPU offload failed; falling back to CPU")
+                pipeline.to("cpu")
         pipeline.enable_attention_slicing()
         pipeline.enable_vae_slicing()
     except Exception as exc:

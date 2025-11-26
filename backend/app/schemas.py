@@ -214,7 +214,7 @@ class NerdBenchEnqueueResponse(BaseModel):
 
 
 class NerdBenchEngineStatus(BaseModel):
-    status: Literal["pending", "running", "done"]
+    status: Literal["pending", "loading_model", "running", "done"]
     elapsed_ms: int | None = None
     image_url: str | None = None
     steps: int | None = None

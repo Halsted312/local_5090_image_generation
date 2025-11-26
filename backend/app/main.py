@@ -103,6 +103,7 @@ ALLOWED_ORIGINS: Iterable[str] = (
     "https://promptpics.ai",
     "https://www.promptpics.ai",
     "https://app.promptpics.ai",
+    "https://app.promptpics.ai",
     "https://promptpics.replit.app",
     "http://localhost:5173",
     "http://localhost:3000",
@@ -111,7 +112,8 @@ ALLOWED_ORIGINS: Iterable[str] = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ALLOWED_ORIGINS),  # Only explicit origins, no wildcards
-    allow_origin_regex=r"https://.*\.replit\.dev",
+    # Allow Replit preview domains and any subdomain of promptpics.ai (including bare and www).
+    allow_origin_regex=r"https://(.+\.replit\.dev|([a-z0-9-]+\.)?promptpics\.ai|([a-z0-9-]+\.)?app\.promptpics\.ai)",
     allow_credentials=False,  # frontend sends credentials: 'omit'
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -1829,6 +1831,11 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
         GEN_QUEUE.wait_for_turn(job["generation_id"])
 
         _free_cuda_memory()
+        try:
+            from .flux_models import unload_all_models_except
+            unload_all_models_except(None)
+        except Exception:
+            pass
         warm_prompt = BENCH_WARMUP_PROMPT
 
         for eng_cfg in engines_payload:
@@ -1918,6 +1925,14 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
         run.status = "done" if run.status != "error" else run.status
         run.current_engine = None
         db.commit()
+
+        # Warm flux back up for live traffic
+        try:
+            unload_all_models_except("flux")
+            _free_cuda_memory()
+            get_text_pipeline()
+        except Exception:
+            logger.warning("Failed to warm flux after bench")
     finally:
         if job:
             GEN_QUEUE.release(job["generation_id"], success=(run.status == "done"), payload={"bench_run_id": str(run_id)})
@@ -2001,75 +2016,80 @@ def enqueue_nerd_bench(
 @app.get("/api/bench/5090/{run_id}", response_model=NerdBenchStatus)
 def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBenchStatus:
     from .models import BenchRun, BenchRunResult
-
     try:
         run_uuid = uuid.UUID(str(run_id))
     except Exception:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run = db.query(BenchRun).filter(BenchRun.id == run_uuid).first()
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    engines_cfg = []
     try:
-        if run.engines_json:
-            engines_cfg = json.loads(run.engines_json)
-    except Exception:
+        run = db.query(BenchRun).filter(BenchRun.id == run_uuid).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+
         engines_cfg = []
+        try:
+            if run.engines_json:
+                engines_cfg = json.loads(run.engines_json)
+        except Exception:
+            engines_cfg = []
 
-    results = db.query(BenchRunResult).filter(BenchRunResult.run_id == run.id).all()
-    by_engine: dict[str, NerdBenchEngineStatus] = {}
+        results = db.query(BenchRunResult).filter(BenchRunResult.run_id == run.id).all()
+        by_engine: dict[str, NerdBenchEngineStatus] = {}
 
-    # Build a lookup for desired params from cfg
-    desired_params = {e.get("engine"): e for e in engines_cfg if isinstance(e, dict)}
+        # Build a lookup for desired params from cfg
+        desired_params = {e.get("engine"): e for e in engines_cfg if isinstance(e, dict)}
 
-    for engine in ["flux_dev", "realvis_xl", "sd3_medium"]:
-        res = next((r for r in results if r.engine == engine), None)
-        if res:
-            by_engine[engine] = NerdBenchEngineStatus(
-                status="done",
-                elapsed_ms=res.elapsed_ms,
-                image_url=f"/api/bench/images/{res.id}",
-                steps=res.steps,
-                guidance=res.guidance,
-                width=res.width,
-                height=res.height,
-                seed=res.seed,
-                tf32=res.tf32_enabled,
-                tf32_enabled=res.tf32_enabled,
-            )
-        else:
-            desired = desired_params.get(engine, {})
-            if run.current_engine == engine:
-                if run.status == "loading_model":
-                    status = "loading_model"
-                elif run.status == "running":
-                    status = "running"
+        for engine in ["flux_dev", "realvis_xl", "sd3_medium"]:
+            res = next((r for r in results if r.engine == engine), None)
+            if res:
+                by_engine[engine] = NerdBenchEngineStatus(
+                    status="done",
+                    elapsed_ms=res.elapsed_ms,
+                    image_url=f"/api/bench/images/{res.id}",
+                    steps=res.steps,
+                    guidance=res.guidance,
+                    width=res.width,
+                    height=res.height,
+                    seed=res.seed,
+                    tf32=res.tf32_enabled,
+                    tf32_enabled=res.tf32_enabled,
+                )
+            else:
+                desired = desired_params.get(engine, {})
+                if run.current_engine == engine:
+                    if run.status == "loading_model":
+                        status = "loading_model"
+                    elif run.status == "running":
+                        status = "running"
+                    else:
+                        status = "pending"
                 else:
                     status = "pending"
-            else:
-                status = "pending"
-            by_engine[engine] = NerdBenchEngineStatus(
-                status=status,
-                steps=desired.get("steps"),
-                guidance=desired.get("guidance"),
-                width=desired.get("width") or run.resolution,
-                height=desired.get("height") or run.resolution,
-                tf32=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
-                tf32_enabled=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
-            )
+                by_engine[engine] = NerdBenchEngineStatus(
+                    status=status,
+                    steps=desired.get("steps"),
+                    guidance=desired.get("guidance"),
+                    width=desired.get("width") or run.resolution,
+                    height=desired.get("height") or run.resolution,
+                    tf32=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
+                    tf32_enabled=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
+                )
 
-    return NerdBenchStatus(
-        run_id=str(run.id),
-        prompt=run.prompt,
-        prompt_length=run.prompt_length,
-        status=run.status,
-        current_engine=run.current_engine,
-        resolution=run.resolution,
-        tf32_enabled=run.tf32_enabled,
-        engines=by_engine,
-    )
+        return NerdBenchStatus(
+            run_id=str(run.id),
+            prompt=run.prompt,
+            prompt_length=run.prompt_length,
+            status=run.status,
+            current_engine=run.current_engine,
+            resolution=run.resolution,
+            tf32_enabled=run.tf32_enabled,
+            engines=by_engine,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Bench status failure for run_id=%s: %s", run_id, exc)
+        raise HTTPException(status_code=500, detail="Bench status unavailable") from exc
 
 
 @app.get("/api/bench/images/{result_id}")
