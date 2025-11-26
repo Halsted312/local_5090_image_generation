@@ -11,6 +11,10 @@ from typing import Any, Deque, Dict, Optional, Set
 
 from fastapi import WebSocket
 
+# Estimated seconds per job type for wait time calculations
+REGULAR_JOB_SECONDS = 12
+BENCH_JOB_SECONDS = 35
+
 
 class QueueFull(Exception):
     """Raised when the queue is at capacity."""
@@ -68,6 +72,18 @@ class GenerationQueue:
     def hub(self) -> WebSocketHub:
         return self._hub
 
+    def _estimate_wait(self, position: int) -> int:
+        """Sum up wait time based on job types ahead in queue."""
+        total = 0
+        for i, job in enumerate(self._queue):
+            if i >= position:
+                break
+            if job.get("job_type") == "bench":
+                total += BENCH_JOB_SECONDS
+            else:
+                total += REGULAR_JOB_SECONDS
+        return total
+
     def _broadcast_positions(self) -> None:
         """Notify all queued sessions of their current position."""
         for idx, job in enumerate(list(self._queue)):
@@ -77,22 +93,24 @@ class GenerationQueue:
                     "type": "queue_update",
                     "generationId": job["generation_id"],
                     "queuePosition": idx,
+                    "estimatedWaitSeconds": self._estimate_wait(idx),
                 },
             )
 
-    def enqueue(self, session_id: str) -> dict[str, Any]:
+    def enqueue(self, session_id: str, job_type: str = "regular", generation_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             if len(self._queue) >= self.capacity:
                 raise QueueFull("Queue full")
             job = {
-                "generation_id": uuid.uuid4().hex,
+                "generation_id": generation_id or uuid.uuid4().hex,
                 "session_id": session_id,
+                "job_type": job_type,
                 "enqueued_at": time.time(),
                 "queue_position": len(self._queue),
             }
             self._queue.append(job)
             position = len(self._queue) - 1
-            est_wait = position * 15  # rough estimate in seconds
+            est_wait = self._estimate_wait(position)
             self._hub.send(
                 session_id,
                 {
