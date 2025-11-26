@@ -106,3 +106,47 @@ class GenerationMetric(Base):
     session_id = Column(String(100), nullable=True)
     share_slug = Column(String(16), nullable=True)
     prompt_metadata = Column(Text, nullable=True)  # e.g., benchmark ids/categories
+
+
+class BenchRun(Base):
+    __tablename__ = "bench_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String(100), nullable=True)
+    prompt = Column(Text, nullable=False)
+    prompt_length = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="queued")  # queued, running, done, error
+    current_engine = Column(String(50), nullable=True)
+    resolution = Column(Integer, nullable=True)  # e.g., 512 or 1024
+    tf32_enabled = Column(Boolean, nullable=True)
+    engines_json = Column(Text, nullable=True)  # original request engines config
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    results = relationship(
+        "BenchRunResult",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class BenchRunResult(Base):
+    __tablename__ = "bench_run_results"
+    __table_args__ = (
+        Index("idx_bench_results_run", "run_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id = Column(UUID(as_uuid=True), ForeignKey("bench_runs.id", ondelete="CASCADE"), nullable=False)
+    engine = Column(String(50), nullable=False)
+    steps = Column(Integer, nullable=False)
+    guidance = Column(Float, nullable=False)
+    width = Column(Integer, nullable=False)
+    height = Column(Integer, nullable=False)
+    seed = Column(Integer, nullable=False)
+    elapsed_ms = Column(Integer, nullable=False)
+    tf32_enabled = Column(Boolean, nullable=False, default=True)
+    image_path = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    run = relationship("BenchRun", back_populates="results")

@@ -21,6 +21,10 @@ GEN_THUMB_ROOT = Path(os.getenv("GEN_THUMB_ROOT", BASE_DIR / "data" / "images" /
 GEN_IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
 GEN_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Bench outputs
+BENCH_IMAGE_ROOT = Path(os.getenv("BENCH_IMAGE_ROOT", BASE_DIR / "data" / "images" / "bench"))
+BENCH_IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "512") or "512")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(1 * 1024 * 1024)) or str(1 * 1024 * 1024))  # 1MB
 JPEG_QUALITY_START = 90
@@ -137,3 +141,14 @@ def save_generation_image(image: Image.Image) -> Tuple[str, str]:
     _save_jpeg_with_limit(thumb, thumb_path, quality=80)
 
     return str(img_path), str(thumb_path)
+
+
+def save_bench_image(run_id: str, engine: str, image: Image.Image) -> str:
+    """
+    Save a bench PNG image and return the absolute path.
+    """
+    filename = f"{run_id}_{engine}_{uuid.uuid4().hex}.png"
+    img_path = (BENCH_IMAGE_ROOT / filename).resolve()
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(img_path, format="PNG")
+    return str(img_path)

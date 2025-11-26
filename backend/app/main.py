@@ -24,7 +24,7 @@ from PIL import Image
 from pathlib import Path
 from sqlalchemy.orm import Session
 
-from .database import Base, engine, get_db
+from .database import Base, engine, get_db, SessionLocal
 from .queue_manager import GenerationQueue, QueueFull
 from .flux_models import (
     get_logo_pipeline,
@@ -32,7 +32,7 @@ from .flux_models import (
     get_sd3_pipeline,
     get_text_pipeline,
 )
-from .models import GenerationLog, GenerationMetric, Prank, PrankTrigger
+from .models import GenerationLog, GenerationMetric, Prank, PrankTrigger, BenchRun, BenchRunResult
 from .prank_matching import get_prank_matcher_llm, match_prank_trigger
 from .model_registry import MODEL_REGISTRY
 from .router_engine import RoutingDecision, route_prompt
@@ -40,6 +40,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from .metrics import get_percentiles, clear_cache
 from .schemas import (
     ImageResponse,
+    BenchEngineSettings,
+    NerdBenchRequest,
+    NerdBenchEnqueueResponse,
+    NerdBenchStatus,
+    NerdBenchEngineStatus,
     PrankCreateResponse,
     PrankDetailResponse,
     PrankGenerateRequest,
@@ -58,11 +63,13 @@ from .schemas import (
 from .storage import (
     GEN_IMAGE_ROOT,
     GEN_THUMB_ROOT,
+    BENCH_IMAGE_ROOT,
     PRANK_IMAGE_ROOT,
     load_prank_image_base64,
     resolve_image_path,
     save_prank_image_with_thumbnail,
     save_generation_image,
+    save_bench_image,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -103,6 +110,7 @@ ALLOWED_ORIGINS: Iterable[str] = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ALLOWED_ORIGINS),  # Only explicit origins, no wildcards
+    allow_origin_regex=r"https://.*\.replit\.dev",
     allow_credentials=False,  # frontend sends credentials: 'omit'
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -110,6 +118,7 @@ app.add_middleware(
 
 SLUG_ALPHABET = string.ascii_letters + string.digits
 GEN_QUEUE = GenerationQueue(capacity=GEN_QUEUE_CAPACITY)
+BENCH_WARMUP_PROMPT = "show me a house on a snowy hill"
 
 # Fast, model-specific preset steps/guidance (ignore frontend sliders for speed).
 MODEL_PRESETS: dict[str, dict[str, float]] = {
@@ -176,6 +185,27 @@ def _free_cuda_memory() -> None:
             torch.cuda.synchronize()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _set_tf32(enabled: bool) -> tuple[bool | None, bool | None]:
+    prev_matmul = getattr(torch.backends.cuda.matmul, "allow_tf32", None) if torch.cuda.is_available() else None
+    prev_cudnn = getattr(torch.backends.cudnn, "allow_tf32", None) if torch.cuda.is_available() else None
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = enabled  # type: ignore[attr-defined]
+        torch.backends.cudnn.allow_tf32 = enabled  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return prev_matmul, prev_cudnn
+
+
+def _restore_tf32(prev_matmul, prev_cudnn) -> None:
+    try:
+        if prev_matmul is not None:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul  # type: ignore[attr-defined]
+        if prev_cudnn is not None:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def _read_gpu_coord_owner() -> tuple[str | None, float | None]:
@@ -735,6 +765,37 @@ def _process_generation(
         matched_trigger_text=None,
         generation_time_ms=generation_time_ms,
     )
+
+
+def _bench_record_run(
+    db: Session,
+    run_id: str,
+    engine: str,
+    steps: int,
+    guidance: float,
+    width: int,
+    height: int,
+    seed: int,
+    elapsed_ms: int,
+    tf32: bool,
+    image_path: str,
+) -> None:
+    from .models import BenchRunResult
+
+    rec = BenchRunResult(
+        run_id=run_id,
+        engine=engine,
+        steps=steps,
+        guidance=guidance,
+        width=width,
+        height=height,
+        seed=seed,
+        elapsed_ms=elapsed_ms,
+        tf32_enabled=tf32,
+        image_path=image_path,
+    )
+    db.add(rec)
+    db.commit()
 
 
 @app.get("/health")
@@ -1734,3 +1795,287 @@ def list_models_api() -> dict:
             }
         )
     return {"models": models}
+
+
+# ---------------------------------------------------------------------------
+# Nerd bench (5090 test)
+# ---------------------------------------------------------------------------
+
+BENCH_PROMPTS: list[str] = [
+    "a cinematic portrait of a woman in neon cyberpunk lighting, detailed skin texture",
+    "a lush landscape of mountains and a lake at sunrise, ultra wide angle",
+    "a futuristic UI dashboard mockup with clean typography and iconography",
+    "a photorealistic cat wearing sunglasses on a city street",
+    "a watercolor painting of a cozy coffee shop interior with warm light",
+]
+
+
+def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], resolution: int | None, tf32_default: bool | None):
+    """Background worker to process a bench run using the shared queue."""
+    db = SessionLocal()
+    job = None
+    try:
+        run = db.query(BenchRun).filter(BenchRun.id == run_id).first()
+        if not run:
+            return
+        session_id = run.session_id or "anon"
+        try:
+            job = GEN_QUEUE.enqueue(session_id)
+        except QueueFull:
+            run.status = "error"
+            db.commit()
+            return
+        GEN_QUEUE.wait_for_turn(job["generation_id"])
+
+        _free_cuda_memory()
+        warm_prompt = BENCH_WARMUP_PROMPT
+
+        for eng_cfg in engines_payload:
+            engine = eng_cfg.engine
+            steps = int(eng_cfg.steps)
+            guidance = float(eng_cfg.guidance)
+            width = eng_cfg.width or resolution or 512
+            height = eng_cfg.height or resolution or 512
+            width = min(width, MAX_IMAGE_SIDE)
+            height = min(height, MAX_IMAGE_SIDE)
+            tf32_flag = eng_cfg.tf32 if eng_cfg.tf32 is not None else (tf32_default if tf32_default is not None else True)
+
+            # Loading phase
+            run.status = "loading_model"
+            run.current_engine = engine
+            db.commit()
+
+            prev_tf32 = _set_tf32(tf32_flag)
+
+            if engine == "flux_dev":
+                pipe = get_text_pipeline()
+            elif engine == "realvis_xl":
+                pipe = get_realvis_pipeline()
+            elif engine == "sd3_medium":
+                pipe = get_sd3_pipeline()
+            else:
+                _restore_tf32(*prev_tf32)
+                continue
+
+            # Warmup (not timed)
+            try:
+                _ = pipe(
+                    warm_prompt,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    width=width,
+                    height=height,
+                    generator=_make_generator(pipe.device, None),
+                )
+            except Exception:
+                _restore_tf32(*prev_tf32)
+                run.status = "error"
+                db.commit()
+                break
+
+            # Timing phase
+            run.status = "running"
+            run.current_engine = engine
+            db.commit()
+
+            seed = secrets.randbelow(2**31 - 1)
+            gen = _make_generator(pipe.device, seed)
+            t0 = time.perf_counter()
+            try:
+                out = pipe(
+                    run.prompt,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    width=width,
+                    height=height,
+                    generator=gen,
+                )
+                image = out.images[0]
+            except Exception:
+                _restore_tf32(*prev_tf32)
+                run.status = "error"
+                db.commit()
+                break
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            _restore_tf32(*prev_tf32)
+
+            image_path = save_bench_image(str(run.id), engine, image)
+            _bench_record_run(
+                db,
+                run_id=str(run.id),
+                engine=engine,
+                steps=steps,
+                guidance=guidance,
+                width=width,
+                height=height,
+                seed=seed,
+                elapsed_ms=elapsed_ms,
+                tf32=tf32_flag,
+                image_path=image_path,
+            )
+
+        run.status = "done" if run.status != "error" else run.status
+        run.current_engine = None
+        db.commit()
+    finally:
+        if job:
+            GEN_QUEUE.release(job["generation_id"], success=(run.status == "done"), payload={"bench_run_id": str(run_id)})
+        db.close()
+
+
+@app.post("/api/bench/5090", response_model=NerdBenchEnqueueResponse)
+def enqueue_nerd_bench(
+    payload: NerdBenchRequest,
+    db: Session = Depends(get_db),
+) -> NerdBenchEnqueueResponse:
+    """
+    Enqueue a nerd bench run. Returns run_id immediately; poll GET /api/bench/5090/{run_id}.
+    """
+    # Basic validation
+    if not payload.prompt or not payload.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt must not be empty")
+    session_id = payload.session_id or "anon"
+    prompt = payload.prompt.strip()
+    prompt_length = len(prompt)
+    resolution = payload.resolution or 512
+    if resolution not in (512, 1024):
+        raise HTTPException(status_code=400, detail="Resolution must be 512 or 1024")
+    resolution = min(resolution, MAX_IMAGE_SIDE)
+    tf32_default = True if payload.tf32_enabled is None else bool(payload.tf32_enabled)
+
+    # Per-engine validation
+    PER_MODEL_LIMITS = {
+        "flux_dev": {"steps_min": 1, "steps_max": 5, "guidance_min": 0.0, "guidance_max": 2.0},
+        "realvis_xl": {"steps_min": 8, "steps_max": 48, "guidance_min": 1.0, "guidance_max": 8.0},
+        "sd3_medium": {"steps_min": 18, "steps_max": 48, "guidance_min": 3.0, "guidance_max": 9.0},
+    }
+    for eng in payload.engines:
+        limits = PER_MODEL_LIMITS.get(eng.engine)
+        if not limits:
+            raise HTTPException(status_code=400, detail=f"Unsupported engine {eng.engine}")
+        if not (limits["steps_min"] <= eng.steps <= limits["steps_max"]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{eng.engine} steps must be between {limits['steps_min']} and {limits['steps_max']}",
+            )
+        if not (limits["guidance_min"] <= eng.guidance <= limits["guidance_max"]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{eng.engine} guidance must be between {limits['guidance_min']} and {limits['guidance_max']}",
+            )
+
+    from .models import BenchRun
+    bench_run = BenchRun(
+        session_id=session_id,
+        prompt=prompt,
+        prompt_length=prompt_length,
+        status="queued",
+        current_engine=None,
+        resolution=resolution,
+        tf32_enabled=tf32_default,
+        engines_json=json.dumps([e.model_dump() for e in payload.engines]),
+    )
+    db.add(bench_run)
+    db.commit()
+    db.refresh(bench_run)
+
+    # Start background worker
+    try:
+        threading.Thread(
+            target=_run_bench_worker,
+            args=(str(bench_run.id), payload.engines, resolution, tf32_default),
+            daemon=True,
+        ).start()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to start bench worker: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to start benchmark") from exc
+
+    return NerdBenchEnqueueResponse(
+        run_id=str(bench_run.id),
+        prompt=prompt,
+        prompt_length=prompt_length,
+    )
+
+
+@app.get("/api/bench/5090/{run_id}", response_model=NerdBenchStatus)
+def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBenchStatus:
+    from .models import BenchRun, BenchRunResult
+
+    try:
+        uuid.UUID(str(run_id))
+    except Exception:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run = db.query(BenchRun).filter(BenchRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    engines_cfg = []
+    try:
+        if run.engines_json:
+            engines_cfg = json.loads(run.engines_json)
+    except Exception:
+        engines_cfg = []
+
+    results = db.query(BenchRunResult).filter(BenchRunResult.run_id == run.id).all()
+    by_engine: dict[str, NerdBenchEngineStatus] = {}
+
+    # Build a lookup for desired params from cfg
+    desired_params = {e.get("engine"): e for e in engines_cfg if isinstance(e, dict)}
+
+    for engine in ["flux_dev", "realvis_xl", "sd3_medium"]:
+        res = next((r for r in results if r.engine == engine), None)
+        if res:
+            by_engine[engine] = NerdBenchEngineStatus(
+                status="done",
+                elapsed_ms=res.elapsed_ms,
+                image_url=f"/api/bench/images/{res.id}",
+                steps=res.steps,
+                guidance=res.guidance,
+                width=res.width,
+                height=res.height,
+                seed=res.seed,
+                tf32=res.tf32_enabled,
+                tf32_enabled=res.tf32_enabled,
+            )
+        else:
+            desired = desired_params.get(engine, {})
+            if run.current_engine == engine:
+                status = "loading_model" if run.status == "loading_model" else ("running" if run.status == "running" else "pending")
+            else:
+                status = "pending"
+            by_engine[engine] = NerdBenchEngineStatus(
+                status=status,
+                steps=desired.get("steps"),
+                guidance=desired.get("guidance"),
+                width=desired.get("width") or run.resolution,
+                height=desired.get("height") or run.resolution,
+                tf32=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
+                tf32_enabled=desired.get("tf32") if desired.get("tf32") is not None else run.tf32_enabled,
+            )
+
+    return NerdBenchStatus(
+        run_id=str(run.id),
+        prompt=run.prompt,
+        prompt_length=run.prompt_length,
+        status=run.status,
+        current_engine=run.current_engine,
+        resolution=run.resolution,
+        tf32_enabled=run.tf32_enabled,
+        engines=by_engine,
+    )
+
+
+@app.get("/api/bench/images/{result_id}")
+def get_bench_image(result_id: str, db: Session = Depends(get_db)):
+    from .models import BenchRunResult
+
+    res = db.query(BenchRunResult).filter(BenchRunResult.id == result_id).first()
+    if not res:
+        raise HTTPException(status_code=404, detail="Bench image not found")
+    path = Path(res.image_path)
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Bench image file missing")
+    return FileResponse(path, media_type=_file_media_type(path))

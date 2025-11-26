@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class TextGenerateRequest(BaseModel):
@@ -178,3 +178,60 @@ class GenerationLogEntry(BaseModel):
     share_slug: str | None = Field(None, alias="share_slug", serialization_alias="shareSlug")
     router_json: dict | None = Field(None, alias="router_json", serialization_alias="routerJson")
     session_id: str | None = Field(None, alias="sessionId", serialization_alias="sessionId")
+
+
+# Bench / Nerd Test
+class BenchEngineSettings(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    engine: Literal["flux_dev", "realvis_xl", "sd3_medium"]
+    steps: int = Field(..., ge=1, le=50)
+    guidance: float = Field(..., ge=0.0, le=50.0)
+    width: int | None = Field(None, ge=256, le=2048)
+    height: int | None = Field(None, ge=256, le=2048)
+    tf32: bool | None = True
+
+
+class NerdBenchRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    engines: list[BenchEngineSettings]
+    prompt: str
+    resolution: int | None = Field(512, ge=256, le=2048, alias="resolution")
+    tf32_enabled: bool | None = Field(True, alias="tf32_enabled")
+    tf32Enabled: bool | None = None  # camelCase tolerance
+    session_id: str | None = Field(None, alias="sessionId")
+
+    @model_validator(mode="after")
+    def normalize_tf32(self):
+        if self.tf32Enabled is not None:
+            self.tf32_enabled = self.tf32Enabled
+        return self
+
+
+class NerdBenchEnqueueResponse(BaseModel):
+    run_id: str
+    prompt: str
+    prompt_length: int
+
+
+class NerdBenchEngineStatus(BaseModel):
+    status: Literal["pending", "running", "done"]
+    elapsed_ms: int | None = None
+    image_url: str | None = None
+    steps: int | None = None
+    guidance: float | None = None
+    width: int | None = None
+    height: int | None = None
+    seed: int | None = None
+    tf32: bool | None = None
+    tf32_enabled: bool | None = None
+
+
+class NerdBenchStatus(BaseModel):
+    run_id: str
+    prompt: str
+    prompt_length: int
+    status: str
+    current_engine: str | None
+    resolution: int | None
+    tf32_enabled: bool | None
+    engines: dict[str, NerdBenchEngineStatus]
