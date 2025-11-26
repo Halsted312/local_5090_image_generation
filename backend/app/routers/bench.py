@@ -240,6 +240,14 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
             pass
         warm_prompt = BENCH_WARMUP_PROMPT
 
+        # Reorder engines to run flux2_dev FIRST - it's a 4-bit quantized model
+        # that needs fresh GPU memory (~17GB). Other models should run after,
+        # even if FLUX.2 doesn't fully release its memory (they can use CPU offload).
+        flux2_first = [e for e in engines_payload if e.engine == "flux2_dev"]
+        others = [e for e in engines_payload if e.engine != "flux2_dev"]
+        engines_payload = flux2_first + others
+        logger.info(f"Engine order: {[e.engine for e in engines_payload]}")
+
         for eng_cfg in engines_payload:
             engine = eng_cfg.engine
             steps = int(eng_cfg.steps)
@@ -285,16 +293,35 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
 
             # Time model loading
             load_start = time.perf_counter()
-            if engine == "flux_dev":
-                pipe = get_text_pipeline()
-            elif engine == "realvis_xl":
-                pipe = get_realvis_pipeline()
-            elif engine == "sd3_medium":
-                pipe = get_sd3_pipeline()
-            elif engine == "flux2_dev":
-                pipe = get_flux2_pipeline()
-            else:
+            try:
+                if engine == "flux_dev":
+                    pipe = get_text_pipeline()
+                elif engine == "realvis_xl":
+                    pipe = get_realvis_pipeline()
+                elif engine == "sd3_medium":
+                    pipe = get_sd3_pipeline()
+                elif engine == "flux2_dev":
+                    pipe = get_flux2_pipeline()
+                else:
+                    restore_tf32(*prev_tf32)
+                    continue
+            except Exception as load_exc:
+                logger.exception("Model load failed for engine %s: %s", engine, load_exc)
                 restore_tf32(*prev_tf32)
+                # Record failed engine result and continue with other engines
+                result = BenchResult(
+                    run_id=run_id,
+                    engine=engine,
+                    status="error",
+                    error_message=f"Model load failed: {load_exc}",
+                    steps=steps,
+                    guidance=guidance,
+                    width=width,
+                    height=height,
+                    tf32_enabled=tf32_flag,
+                )
+                db.add(result)
+                db.commit()
                 continue
             load_end = time.perf_counter()
             metrics["model_load_ms"] = int((load_end - load_start) * 1000)
@@ -312,10 +339,9 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
             try:
                 if engine == "flux2_dev":
                     # FLUX2 requires remote text encoder for prompt embeddings
-                    prompt_embeds, pooled_prompt_embeds = _remote_text_encoder(warm_prompt, str(pipe.device))
+                    prompt_embeds = _remote_text_encoder(warm_prompt, str(pipe.device))
                     _ = pipe(
                         prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
                         num_inference_steps=steps,
                         guidance_scale=guidance,
                         width=width,
@@ -331,11 +357,24 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
                         height=height,
                         generator=make_generator(pipe.device, None),
                     )
-            except Exception:
+            except Exception as warmup_exc:
+                logger.exception("Warmup failed for engine %s: %s", engine, warmup_exc)
                 restore_tf32(*prev_tf32)
-                run.status = "error"
+                # Record failed engine result and continue with other engines
+                result = BenchResult(
+                    run_id=run_id,
+                    engine=engine,
+                    status="error",
+                    error_message=f"Warmup failed: {warmup_exc}",
+                    steps=steps,
+                    guidance=guidance,
+                    width=width,
+                    height=height,
+                    tf32_enabled=tf32_flag,
+                )
+                db.add(result)
                 db.commit()
-                break
+                continue
             warmup_end = time.perf_counter()
             metrics["warmup_ms"] = int((warmup_end - warmup_start) * 1000)
 
@@ -358,7 +397,7 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
                 if engine == "flux2_dev":
                     # Time remote text encoder separately
                     te_start = time.perf_counter()
-                    prompt_embeds, pooled_prompt_embeds = _remote_text_encoder(run.prompt, str(pipe.device))
+                    prompt_embeds = _remote_text_encoder(run.prompt, str(pipe.device))
                     te_end = time.perf_counter()
                     text_encoder_ms = int((te_end - te_start) * 1000)
                     metrics["text_encoder_ms"] = text_encoder_ms
@@ -367,7 +406,6 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
                     inf_start = time.perf_counter()
                     out = pipe(
                         prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
                         num_inference_steps=steps,
                         guidance_scale=guidance,
                         width=width,
@@ -389,7 +427,8 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
                     inf_end = time.perf_counter()
                     metrics["inference_only_ms"] = int((inf_end - inf_start) * 1000)
                 image = out.images[0]
-            except Exception:
+            except Exception as infer_exc:
+                logger.exception("Inference failed for engine %s: %s", engine, infer_exc)
                 restore_tf32(*prev_tf32)
                 run.status = "error"
                 db.commit()

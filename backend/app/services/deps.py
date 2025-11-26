@@ -141,17 +141,28 @@ def file_media_type(path: Path) -> str:
 
 
 def free_cuda_memory() -> None:
-    """Best-effort VRAM cleanup after requests to reduce OOM risk."""
+    """Aggressive VRAM cleanup to prevent OOM between model loads."""
+    import gc
+    # Force Python garbage collection first
+    gc.collect()
+    gc.collect()
+
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         try:
             torch.cuda.ipc_collect()
         except Exception:
             pass
+        # Reset memory stats for accurate tracking
         try:
-            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
         except Exception:
             pass
+        # Final sync and clear
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def set_tf32(enabled: bool) -> tuple[bool | None, bool | None]:

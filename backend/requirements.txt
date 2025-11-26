@@ -1,9 +1,10 @@
 fastapi
 uvicorn[standard]
 pydantic
-diffusers>=0.31.0
+https://github.com/huggingface/diffusers/archive/refs/heads/main.zip
 transformers>=4.44.0
 accelerate
+bitsandbytes
 safetensors
 sentencepiece
 Pillow

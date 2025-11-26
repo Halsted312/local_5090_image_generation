@@ -9,7 +9,7 @@ import os
 
 import requests
 import torch
-from diffusers import FluxPipeline, StableDiffusion3Pipeline, StableDiffusionXLPipeline
+from diffusers import FluxPipeline, Flux2Pipeline, StableDiffusion3Pipeline, StableDiffusionXLPipeline
 try:
     from diffusers import HiDreamImagePipeline
 except ImportError:
@@ -81,14 +81,49 @@ def unload_all_models_except(keep_model: str | None = None):
         _logo_pipeline = None
 
     if keep_model != "flux2" and _flux2_pipeline is not None:
-        logger.info("Unloading FLUX.2 pipeline")
+        logger.info("Unloading FLUX.2 pipeline - using aggressive cleanup for bitsandbytes 4-bit")
+        # bitsandbytes 4-bit models need to be moved to CPU first to release GPU memory
+        try:
+            # Move entire pipeline to CPU first - this should release GPU memory for 4-bit weights
+            logger.info("Moving FLUX.2 to CPU before deletion...")
+            _flux2_pipeline.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+                logger.info(f"GPU memory after FLUX.2 to CPU: {free_mem:.2f} GB")
+        except Exception as exc:
+            logger.warning("Failed to move FLUX.2 to CPU: %s", exc)
+        # Now delete the pipeline
         del _flux2_pipeline
         _flux2_pipeline = None
+        # Extra gc passes for bitsandbytes cleanup
+        import gc
+        gc.collect()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     # Aggressive memory clearing
+    import gc
+    gc.collect()
+    gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
+        except Exception:
+            pass
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         logger.info(f"GPU memory cleared. Free memory: {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB")
 
 
@@ -336,10 +371,10 @@ def get_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
     return _logo_pipeline
 
 
-def _remote_text_encoder(prompt: str, device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
+def _remote_text_encoder(prompt: str, device: str = "cuda") -> torch.Tensor:
     """
     Call the official remote text encoder for FLUX.2 [dev].
-    Returns prompt_embeds and pooled_prompt_embeds tensors.
+    Returns prompt_embeds tensor for use with Flux2Pipeline.
     """
     token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
     if not token:
@@ -364,19 +399,32 @@ def _remote_text_encoder(prompt: str, device: str = "cuda") -> tuple[torch.Tenso
     logger.info("Remote text encoder returned embeddings successfully")
 
     # Handle different return formats from the endpoint
+    logger.info("Remote text encoder data type: %s", type(data))
     if isinstance(data, dict):
+        logger.info("Remote text encoder data keys: %s", list(data.keys()))
         prompt_embeds = data.get("prompt_embeds", data.get("embeddings"))
-        pooled_prompt_embeds = data.get("pooled_prompt_embeds", data.get("pooled_embeddings"))
-    elif isinstance(data, (list, tuple)) and len(data) >= 2:
-        prompt_embeds, pooled_prompt_embeds = data[0], data[1]
-    else:
+    elif isinstance(data, (list, tuple)) and len(data) >= 1:
+        prompt_embeds = data[0]
+    elif isinstance(data, torch.Tensor):
+        # FLUX.2 remote text encoder returns a single Tensor that is the prompt_embeds
+        logger.info("Remote text encoder returned Tensor shape: %s, dtype: %s", data.shape, data.dtype)
         prompt_embeds = data
-        pooled_prompt_embeds = None
+    else:
+        logger.warning("Unexpected data format from remote text encoder: %s", type(data))
+        raise RuntimeError(f"Unexpected remote text encoder format: {type(data)}")
 
-    return prompt_embeds, pooled_prompt_embeds
+    if prompt_embeds is None:
+        raise RuntimeError(
+            f"Remote text encoder did not return prompt_embeds. "
+            f"Data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'N/A'}"
+        )
+
+    logger.info("prompt_embeds shape: %s", prompt_embeds.shape if hasattr(prompt_embeds, 'shape') else 'N/A')
+
+    return prompt_embeds
 
 
-def _load_flux2_pipeline() -> FluxPipeline:
+def _load_flux2_pipeline() -> Flux2Pipeline:
     """
     Load the FLUX.2-dev 4-bit quantized pipeline.
     Uses remote text encoder for prompt embeddings.
@@ -396,25 +444,32 @@ def _load_flux2_pipeline() -> FluxPipeline:
             free_mem = torch.cuda.mem_get_info()[0] / 1024**3
             logger.info(f"Available GPU memory before FLUX.2 load: {free_mem:.2f} GB")
 
-        # Load the 4-bit quantized pipeline
-        # Note: text_encoder is set to None since we use remote text encoder
-        pipeline = FluxPipeline.from_pretrained(
+        # Load the 4-bit quantized pipeline using Flux2Pipeline
+        # We use remote text encoder API instead to save ~10GB VRAM
+        # Note: bitsandbytes 4-bit doesn't support device_map with CPU offload
+        pipeline = Flux2Pipeline.from_pretrained(
             FLUX2_4BIT_MODEL_ID,
             torch_dtype=torch.bfloat16,
             token=token,
+            text_encoder=None,
+            tokenizer=None,
         )
 
         _disable_safety(pipeline)
 
+        # Move to GPU - 4-bit model should fit in ~15GB
         try:
             pipeline.to(device)
+            logger.info("FLUX.2 loaded directly to GPU")
         except Exception as exc:
-            logger.warning("FLUX.2 pipeline load to device failed (%s); enabling CPU offload.", exc)
+            logger.warning("FLUX.2 direct GPU load failed (%s); trying sequential CPU offload", exc)
             try:
-                pipeline.enable_model_cpu_offload()
-            except Exception:
-                logger.warning("CPU offload failed; falling back to sequential CPU offload")
                 pipeline.enable_sequential_cpu_offload()
+                logger.info("FLUX.2 loaded with sequential CPU offload")
+            except Exception as e2:
+                logger.warning("Sequential CPU offload also failed: %s", e2)
+                pipeline.enable_model_cpu_offload()
+                logger.info("FLUX.2 loaded with model CPU offload")
 
         if hasattr(pipeline, 'enable_attention_slicing'):
             pipeline.enable_attention_slicing()

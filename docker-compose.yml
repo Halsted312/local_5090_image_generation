@@ -24,6 +24,7 @@ services:
       - GPU_COORD_PATH=/gpu_coord/status.json
       - EXCLUDED_LIVE_MODELS=${EXCLUDED_LIVE_MODELS:-hidream_dev}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - MAX_IMAGE_SIDE=1024
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./prank_images:/data/prank_images

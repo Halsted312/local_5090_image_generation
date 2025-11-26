@@ -24,3 +24,4 @@ research/benchmark_results/testing/images/
 research/benchmark_results/
 backend/model_research/
 .gitignore
+research/
