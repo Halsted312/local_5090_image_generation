@@ -23,6 +23,13 @@ HIDREAM_GUIDANCE: float = float(os.getenv("HIDREAM_GUIDANCE", "5.0"))
 # Llama text encoder for HiDream
 HIDREAM_TEXT_ENCODER_ID: str = os.getenv("HIDREAM_TEXT_ENCODER_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 
+# FLUX.2-dev 4-bit quantized model (32B params)
+FLUX2_4BIT_MODEL_ID: str = os.getenv("FLUX2_4BIT_MODEL_ID", "diffusers/FLUX.2-dev-bnb-4bit")
+FLUX2_REMOTE_TEXT_ENCODER_URL: str = os.getenv(
+    "FLUX2_REMOTE_TEXT_ENCODER_URL",
+    "https://remote-text-encoder-flux-2.huggingface.co/predict"
+)
+
 # Prank matching (embeddings + LLM)
 PRANK_EMBED_MODEL_ID: str = os.getenv("PRANK_EMBED_MODEL_ID", "BAAI/bge-small-en-v1.5")
 PRANK_EMBED_ACCEPT_THRESHOLD: float = float(os.getenv("PRANK_EMBED_ACCEPT_THRESHOLD", "0.93"))

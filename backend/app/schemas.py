@@ -15,7 +15,7 @@ class TextGenerateRequest(BaseModel):
     width: int = Field(768, ge=256, le=2048)
     height: int = Field(768, ge=256, le=2048)
     seed: int | None = Field(None, description="Optional RNG seed for reproducibility")
-    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev"] = Field(
+    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev", "flux2_dev"] = Field(
         "auto", description="Engine override; 'auto' uses router"
     )
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
@@ -109,7 +109,7 @@ class PrankGenerateRequest(BaseModel):
     height: int | None = Field(None, ge=256, le=2048)
     seed: int | None = Field(None, description="Optional RNG seed for prank generation")
     session_id: str | None = Field(None, alias="sessionId", description="Optional session identifier")
-    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev"] | None = Field(
+    engine: Literal["auto", "flux_dev", "realvis_xl", "sd3_medium", "hidream_dev", "flux2_dev"] | None = Field(
         None, alias="engine", description="Engine override; defaults to auto"
     )
 
@@ -183,7 +183,7 @@ class GenerationLogEntry(BaseModel):
 # Bench / Nerd Test
 class BenchEngineSettings(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    engine: Literal["flux_dev", "realvis_xl", "sd3_medium"]
+    engine: Literal["flux_dev", "realvis_xl", "sd3_medium", "flux2_dev"]
     steps: int = Field(..., ge=1, le=50)
     guidance: float = Field(..., ge=0.0, le=50.0)
     width: int | None = Field(None, ge=256, le=2048)

@@ -25,6 +25,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, object]] = {
         "tags": ["logo", "icon", "text", "prompt-following"],
         "notes": "HiDream-I1-Dev (lighter) for text rendering and logos.",
     },
+    "flux2_dev": {
+        "display_name": "FLUX.2-dev 4-bit",
+        "tags": ["general", "text", "typography", "multi-reference"],
+        "notes": "32B param SOTA model, 4-bit quantized, remote text encoder.",
+    },
 }
 
 

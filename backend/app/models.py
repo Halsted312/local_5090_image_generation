@@ -149,4 +149,33 @@ class BenchRunResult(Base):
     image_path = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # Extended metrics for data science
+    model_load_ms = Column(Integer, nullable=True)  # Time to load model into GPU
+    warmup_ms = Column(Integer, nullable=True)  # Time for warmup inference
+    text_encoder_ms = Column(Integer, nullable=True)  # Remote text encoder latency (FLUX2)
+    inference_only_ms = Column(Integer, nullable=True)  # Pure inference time (no text encoding)
+
+    # GPU memory metrics (in MB for easier reading)
+    gpu_mem_before_load_mb = Column(Integer, nullable=True)  # GPU memory before model load
+    gpu_mem_after_load_mb = Column(Integer, nullable=True)  # GPU memory after model load
+    gpu_mem_peak_mb = Column(Integer, nullable=True)  # Peak GPU memory during inference
+    gpu_mem_after_inference_mb = Column(Integer, nullable=True)  # GPU memory after inference
+    gpu_mem_allocated_mb = Column(Integer, nullable=True)  # torch.cuda.memory_allocated
+    gpu_mem_reserved_mb = Column(Integer, nullable=True)  # torch.cuda.memory_reserved
+
+    # Hardware info
+    gpu_name = Column(String(100), nullable=True)  # e.g., "NVIDIA GeForce RTX 5090"
+    gpu_compute_capability = Column(String(10), nullable=True)  # e.g., "9.0"
+    gpu_total_mem_mb = Column(Integer, nullable=True)  # Total GPU memory
+
+    # Software versions for reproducibility
+    torch_version = Column(String(50), nullable=True)
+    diffusers_version = Column(String(50), nullable=True)
+    python_version = Column(String(20), nullable=True)
+
+    # Model metadata
+    model_dtype = Column(String(20), nullable=True)  # e.g., "bfloat16", "float16"
+    quantization = Column(String(20), nullable=True)  # e.g., "4bit", "8bit", "none"
+    uses_remote_encoder = Column(Boolean, nullable=True)  # True for FLUX2
+
     run = relationship("BenchRun", back_populates="results")

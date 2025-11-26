@@ -28,10 +28,13 @@ from sqlalchemy.orm import Session
 from .database import Base, engine, get_db, SessionLocal
 from .queue_manager import GenerationQueue, QueueFull
 from .flux_models import (
+    get_flux2_pipeline,
     get_logo_pipeline,
     get_realvis_pipeline,
     get_sd3_pipeline,
     get_text_pipeline,
+    generate_flux2,
+    _remote_text_encoder,
 )
 from .models import GenerationLog, GenerationMetric, Prank, PrankTrigger, BenchRun, BenchRunResult
 from .prank_matching import get_prank_matcher_llm, match_prank_trigger
@@ -129,6 +132,7 @@ MODEL_PRESETS: dict[str, dict[str, float]] = {
     "realvis_xl": {"steps": 22, "guidance": 3.5},
     "sd3_medium": {"steps": 26, "guidance": 7.0},
     "hidream_dev": {"steps": 28, "guidance": 1.0},
+    "flux2_dev": {"steps": 24, "guidance": 4.0},
 }
 
 
@@ -782,6 +786,26 @@ def _bench_record_run(
     elapsed_ms: int,
     tf32: bool,
     image_path: str,
+    # Extended metrics
+    model_load_ms: int | None = None,
+    warmup_ms: int | None = None,
+    text_encoder_ms: int | None = None,
+    inference_only_ms: int | None = None,
+    gpu_mem_before_load_mb: int | None = None,
+    gpu_mem_after_load_mb: int | None = None,
+    gpu_mem_peak_mb: int | None = None,
+    gpu_mem_after_inference_mb: int | None = None,
+    gpu_mem_allocated_mb: int | None = None,
+    gpu_mem_reserved_mb: int | None = None,
+    gpu_name: str | None = None,
+    gpu_compute_capability: str | None = None,
+    gpu_total_mem_mb: int | None = None,
+    torch_version: str | None = None,
+    diffusers_version: str | None = None,
+    python_version: str | None = None,
+    model_dtype: str | None = None,
+    quantization: str | None = None,
+    uses_remote_encoder: bool | None = None,
 ) -> None:
     from .models import BenchRunResult
 
@@ -796,6 +820,26 @@ def _bench_record_run(
         elapsed_ms=elapsed_ms,
         tf32_enabled=tf32,
         image_path=image_path,
+        # Extended metrics
+        model_load_ms=model_load_ms,
+        warmup_ms=warmup_ms,
+        text_encoder_ms=text_encoder_ms,
+        inference_only_ms=inference_only_ms,
+        gpu_mem_before_load_mb=gpu_mem_before_load_mb,
+        gpu_mem_after_load_mb=gpu_mem_after_load_mb,
+        gpu_mem_peak_mb=gpu_mem_peak_mb,
+        gpu_mem_after_inference_mb=gpu_mem_after_inference_mb,
+        gpu_mem_allocated_mb=gpu_mem_allocated_mb,
+        gpu_mem_reserved_mb=gpu_mem_reserved_mb,
+        gpu_name=gpu_name,
+        gpu_compute_capability=gpu_compute_capability,
+        gpu_total_mem_mb=gpu_total_mem_mb,
+        torch_version=torch_version,
+        diffusers_version=diffusers_version,
+        python_version=python_version,
+        model_dtype=model_dtype,
+        quantization=quantization,
+        uses_remote_encoder=uses_remote_encoder,
     )
     db.add(rec)
     db.commit()
@@ -1051,6 +1095,37 @@ def _validate_image_path(slug: str, relative_path: str) -> str:
     return str(resolved)
 
 
+@app.get("/api/pranks/summaries", response_model=list[PrankSummary])
+def list_prank_summaries(
+    session_id: str | None = Query(None, alias="sessionId"),
+    db: Session = Depends(get_db),
+) -> list[PrankSummary]:
+    """
+    Lightweight prank summaries without base64 payloads.
+    Must be defined BEFORE /api/pranks/{slug} to avoid route collision.
+    """
+    if not session_id:
+        return []
+
+    pranks = (
+        db.query(Prank)
+        .filter(Prank.session_id == session_id)
+        .order_by(Prank.created_at.desc())
+        .all()
+    )
+
+    results: list[PrankSummary] = []
+    for prank in pranks:
+        trigger_count = (
+            db.query(PrankTrigger)
+            .filter(PrankTrigger.prank_id == prank.id)
+            .count()
+        )
+        payload = _prank_to_summary(prank, trigger_count)
+        results.append(PrankSummary(**payload))
+    return results
+
+
 @app.get("/api/pranks/{slug}", response_model=PrankDetailResponse)
 def get_prank(slug: str, db: Session = Depends(get_db)) -> PrankDetailResponse:
     prank = _get_prank_by_slug(db, slug)
@@ -1099,36 +1174,6 @@ def list_pranks(
         )
         payload = _prank_to_response(prank, triggers)
         results.append(PrankDetailResponse(**payload))
-    return results
-
-
-@app.get("/api/pranks/summaries", response_model=list[PrankSummary])
-def list_prank_summaries(
-    session_id: str | None = Query(None, alias="sessionId"),
-    db: Session = Depends(get_db),
-) -> list[PrankSummary]:
-    """
-    Lightweight prank summaries without base64 payloads.
-    """
-    if not session_id:
-        return []
-
-    pranks = (
-        db.query(Prank)
-        .filter(Prank.session_id == session_id)
-        .order_by(Prank.created_at.desc())
-        .all()
-    )
-
-    results: list[PrankSummary] = []
-    for prank in pranks:
-        trigger_count = (
-            db.query(PrankTrigger)
-            .filter(PrankTrigger.prank_id == prank.id)
-            .count()
-        )
-        payload = _prank_to_summary(prank, trigger_count)
-        results.append(PrankSummary(**payload))
     return results
 
 
@@ -1801,8 +1846,83 @@ def list_models_api() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Nerd bench (5090 test)
+# Nerd bench (5090 test) - GPU metrics helpers
 # ---------------------------------------------------------------------------
+
+def _get_gpu_info() -> dict:
+    """Get GPU hardware info for data science."""
+    info = {
+        "gpu_name": None,
+        "gpu_compute_capability": None,
+        "gpu_total_mem_mb": None,
+    }
+    if torch.cuda.is_available():
+        try:
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            info["gpu_compute_capability"] = f"{cap[0]}.{cap[1]}"
+            info["gpu_total_mem_mb"] = int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+        except Exception:
+            pass
+    return info
+
+
+def _get_gpu_memory_mb() -> dict:
+    """Get current GPU memory usage in MB."""
+    mem = {
+        "allocated_mb": None,
+        "reserved_mb": None,
+        "free_mb": None,
+    }
+    if torch.cuda.is_available():
+        try:
+            mem["allocated_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+            mem["reserved_mb"] = int(torch.cuda.memory_reserved() / (1024 * 1024))
+            free, total = torch.cuda.mem_get_info()
+            mem["free_mb"] = int(free / (1024 * 1024))
+        except Exception:
+            pass
+    return mem
+
+
+def _get_software_versions() -> dict:
+    """Get software versions for reproducibility."""
+    import sys
+    versions = {
+        "torch_version": None,
+        "diffusers_version": None,
+        "python_version": None,
+    }
+    try:
+        versions["torch_version"] = torch.__version__
+    except Exception:
+        pass
+    try:
+        import diffusers
+        versions["diffusers_version"] = diffusers.__version__
+    except Exception:
+        pass
+    try:
+        versions["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    except Exception:
+        pass
+    return versions
+
+
+def _get_model_metadata(engine: str) -> dict:
+    """Get model-specific metadata."""
+    metadata = {
+        "model_dtype": "bfloat16",
+        "quantization": "none",
+        "uses_remote_encoder": False,
+    }
+    if engine == "flux2_dev":
+        metadata["quantization"] = "4bit"
+        metadata["uses_remote_encoder"] = True
+    elif engine == "hidream_dev":
+        metadata["model_dtype"] = "float16"
+    return metadata
+
 
 BENCH_PROMPTS: list[str] = [
     "a cinematic portrait of a woman in neon cyberpunk lighting, detailed skin texture",
@@ -1815,6 +1935,8 @@ BENCH_PROMPTS: list[str] = [
 
 def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], resolution: int | None, tf32_default: bool | None):
     """Background worker to process a bench run using the shared queue."""
+    from .flux_models import unload_all_models_except
+
     db = SessionLocal()
     job = None
     try:
@@ -1830,9 +1952,12 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
             return
         GEN_QUEUE.wait_for_turn(job["generation_id"])
 
+        # Capture GPU info and software versions once at start
+        gpu_info = _get_gpu_info()
+        sw_versions = _get_software_versions()
+
         _free_cuda_memory()
         try:
-            from .flux_models import unload_all_models_except
             unload_all_models_except(None)
         except Exception:
             pass
@@ -1848,6 +1973,32 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
             height = min(height, MAX_IMAGE_SIDE)
             tf32_flag = eng_cfg.tf32 if eng_cfg.tf32 is not None else (tf32_default if tf32_default is not None else True)
 
+            # Clear memory before each model for accurate metrics
+            try:
+                unload_all_models_except(None)
+                _free_cuda_memory()
+            except Exception:
+                pass
+
+            # Initialize metrics for this engine
+            metrics = {
+                "model_load_ms": None,
+                "warmup_ms": None,
+                "text_encoder_ms": None,
+                "inference_only_ms": None,
+                "gpu_mem_before_load_mb": None,
+                "gpu_mem_after_load_mb": None,
+                "gpu_mem_peak_mb": None,
+                "gpu_mem_after_inference_mb": None,
+                "gpu_mem_allocated_mb": None,
+                "gpu_mem_reserved_mb": None,
+            }
+            model_metadata = _get_model_metadata(engine)
+
+            # Capture memory before load
+            mem_before = _get_gpu_memory_mb()
+            metrics["gpu_mem_before_load_mb"] = mem_before.get("allocated_mb")
+
             # Loading phase
             run.status = "loading_model"
             run.current_engine = engine
@@ -1855,31 +2006,65 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
 
             prev_tf32 = _set_tf32(tf32_flag)
 
+            # Time model loading
+            load_start = time.perf_counter()
             if engine == "flux_dev":
                 pipe = get_text_pipeline()
             elif engine == "realvis_xl":
                 pipe = get_realvis_pipeline()
             elif engine == "sd3_medium":
                 pipe = get_sd3_pipeline()
+            elif engine == "flux2_dev":
+                pipe = get_flux2_pipeline()
             else:
                 _restore_tf32(*prev_tf32)
                 continue
+            load_end = time.perf_counter()
+            metrics["model_load_ms"] = int((load_end - load_start) * 1000)
 
-            # Warmup (not timed)
+            # Capture memory after load
+            mem_after_load = _get_gpu_memory_mb()
+            metrics["gpu_mem_after_load_mb"] = mem_after_load.get("allocated_mb")
+
+            # Reset peak memory tracking
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
+            # Warmup phase (timed for metrics)
+            warmup_start = time.perf_counter()
             try:
-                _ = pipe(
-                    warm_prompt,
-                    num_inference_steps=steps,
-                    guidance_scale=guidance,
-                    width=width,
-                    height=height,
-                    generator=_make_generator(pipe.device, None),
-                )
+                if engine == "flux2_dev":
+                    # FLUX2 requires remote text encoder for prompt embeddings
+                    prompt_embeds, pooled_prompt_embeds = _remote_text_encoder(warm_prompt, str(pipe.device))
+                    _ = pipe(
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        width=width,
+                        height=height,
+                        generator=_make_generator(pipe.device, None),
+                    )
+                else:
+                    _ = pipe(
+                        warm_prompt,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        width=width,
+                        height=height,
+                        generator=_make_generator(pipe.device, None),
+                    )
             except Exception:
                 _restore_tf32(*prev_tf32)
                 run.status = "error"
                 db.commit()
                 break
+            warmup_end = time.perf_counter()
+            metrics["warmup_ms"] = int((warmup_end - warmup_start) * 1000)
+
+            # Reset peak memory for actual inference
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
 
             # Timing phase
             run.status = "running"
@@ -1888,23 +2073,67 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
 
             seed = secrets.randbelow(2**31 - 1)
             gen = _make_generator(pipe.device, seed)
-            t0 = time.perf_counter()
+
+            # Time text encoder and inference separately for FLUX2
+            text_encoder_ms = 0
+            inference_start = time.perf_counter()
             try:
-                out = pipe(
-                    run.prompt,
-                    num_inference_steps=steps,
-                    guidance_scale=guidance,
-                    width=width,
-                    height=height,
-                    generator=gen,
-                )
+                if engine == "flux2_dev":
+                    # Time remote text encoder separately
+                    te_start = time.perf_counter()
+                    prompt_embeds, pooled_prompt_embeds = _remote_text_encoder(run.prompt, str(pipe.device))
+                    te_end = time.perf_counter()
+                    text_encoder_ms = int((te_end - te_start) * 1000)
+                    metrics["text_encoder_ms"] = text_encoder_ms
+
+                    # Time pure inference
+                    inf_start = time.perf_counter()
+                    out = pipe(
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        width=width,
+                        height=height,
+                        generator=gen,
+                    )
+                    inf_end = time.perf_counter()
+                    metrics["inference_only_ms"] = int((inf_end - inf_start) * 1000)
+                else:
+                    inf_start = time.perf_counter()
+                    out = pipe(
+                        run.prompt,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance,
+                        width=width,
+                        height=height,
+                        generator=gen,
+                    )
+                    inf_end = time.perf_counter()
+                    metrics["inference_only_ms"] = int((inf_end - inf_start) * 1000)
                 image = out.images[0]
             except Exception:
                 _restore_tf32(*prev_tf32)
                 run.status = "error"
                 db.commit()
                 break
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+            # Calculate total elapsed time from inference start
+            elapsed_ms = int((time.perf_counter() - inference_start) * 1000)
+
+            # Capture peak memory after inference
+            if torch.cuda.is_available():
+                try:
+                    metrics["gpu_mem_peak_mb"] = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+                except Exception:
+                    pass
+
+            # Capture final memory state
+            mem_after = _get_gpu_memory_mb()
+            metrics["gpu_mem_after_inference_mb"] = mem_after.get("allocated_mb")
+            metrics["gpu_mem_allocated_mb"] = mem_after.get("allocated_mb")
+            metrics["gpu_mem_reserved_mb"] = mem_after.get("reserved_mb")
+
             _restore_tf32(*prev_tf32)
 
             image_path = save_bench_image(str(run.id), engine, image)
@@ -1920,6 +2149,29 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
                 elapsed_ms=elapsed_ms,
                 tf32=tf32_flag,
                 image_path=image_path,
+                # Extended metrics
+                model_load_ms=metrics["model_load_ms"],
+                warmup_ms=metrics["warmup_ms"],
+                text_encoder_ms=metrics["text_encoder_ms"],
+                inference_only_ms=metrics["inference_only_ms"],
+                gpu_mem_before_load_mb=metrics["gpu_mem_before_load_mb"],
+                gpu_mem_after_load_mb=metrics["gpu_mem_after_load_mb"],
+                gpu_mem_peak_mb=metrics["gpu_mem_peak_mb"],
+                gpu_mem_after_inference_mb=metrics["gpu_mem_after_inference_mb"],
+                gpu_mem_allocated_mb=metrics["gpu_mem_allocated_mb"],
+                gpu_mem_reserved_mb=metrics["gpu_mem_reserved_mb"],
+                # GPU info
+                gpu_name=gpu_info.get("gpu_name"),
+                gpu_compute_capability=gpu_info.get("gpu_compute_capability"),
+                gpu_total_mem_mb=gpu_info.get("gpu_total_mem_mb"),
+                # Software versions
+                torch_version=sw_versions.get("torch_version"),
+                diffusers_version=sw_versions.get("diffusers_version"),
+                python_version=sw_versions.get("python_version"),
+                # Model metadata
+                model_dtype=model_metadata.get("model_dtype"),
+                quantization=model_metadata.get("quantization"),
+                uses_remote_encoder=model_metadata.get("uses_remote_encoder"),
             )
 
         run.status = "done" if run.status != "error" else run.status
@@ -1964,6 +2216,7 @@ def enqueue_nerd_bench(
         "flux_dev": {"steps_min": 1, "steps_max": 5, "guidance_min": 0.0, "guidance_max": 2.0},
         "realvis_xl": {"steps_min": 8, "steps_max": 48, "guidance_min": 1.0, "guidance_max": 8.0},
         "sd3_medium": {"steps_min": 18, "steps_max": 48, "guidance_min": 3.0, "guidance_max": 9.0},
+        "flux2_dev": {"steps_min": 20, "steps_max": 28, "guidance_min": 3.5, "guidance_max": 4.5},
     }
     for eng in payload.engines:
         limits = PER_MODEL_LIMITS.get(eng.engine)
@@ -2039,7 +2292,7 @@ def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBen
         # Build a lookup for desired params from cfg
         desired_params = {e.get("engine"): e for e in engines_cfg if isinstance(e, dict)}
 
-        for engine in ["flux_dev", "realvis_xl", "sd3_medium"]:
+        for engine in ["flux_dev", "realvis_xl", "sd3_medium", "flux2_dev"]:
             res = next((r for r in results if r.engine == engine), None)
             if res:
                 by_engine[engine] = NerdBenchEngineStatus(

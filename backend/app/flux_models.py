@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import threading
 import os
 
+import requests
 import torch
 from diffusers import FluxPipeline, StableDiffusion3Pipeline, StableDiffusionXLPipeline
 try:
@@ -17,6 +19,8 @@ from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
 
 from .config import (
     FLUX_TEXT_MODEL_ID,
+    FLUX2_4BIT_MODEL_ID,
+    FLUX2_REMOTE_TEXT_ENCODER_URL,
     LOGO_SDXL_MODEL_ID,
     REALVIS_MODEL_ID,
     SD3_MODEL_ID,
@@ -30,6 +34,7 @@ _text_pipeline: FluxPipeline | None = None
 _realvis_pipeline: StableDiffusionXLPipeline | None = None
 _sd3_pipeline: StableDiffusion3Pipeline | None = None
 _logo_pipeline: HiDreamImagePipeline | StableDiffusionXLPipeline | None = None
+_flux2_pipeline: FluxPipeline | None = None
 _lock = threading.Lock()
 
 
@@ -49,9 +54,9 @@ def _disable_safety(pipe) -> None:
         pass
 
 
-def unload_all_models_except(keep_model: str = None):
+def unload_all_models_except(keep_model: str | None = None):
     """Unload all models except the specified one to free GPU memory."""
-    global _text_pipeline, _realvis_pipeline, _sd3_pipeline, _logo_pipeline
+    global _text_pipeline, _realvis_pipeline, _sd3_pipeline, _logo_pipeline, _flux2_pipeline
 
     logger.info(f"Unloading all models except: {keep_model}")
 
@@ -74,6 +79,11 @@ def unload_all_models_except(keep_model: str = None):
         logger.info("Unloading Logo/HiDream pipeline")
         del _logo_pipeline
         _logo_pipeline = None
+
+    if keep_model != "flux2" and _flux2_pipeline is not None:
+        logger.info("Unloading FLUX.2 pipeline")
+        del _flux2_pipeline
+        _flux2_pipeline = None
 
     # Aggressive memory clearing
     if torch.cuda.is_available():
@@ -324,3 +334,153 @@ def get_logo_pipeline() -> HiDreamImagePipeline | StableDiffusionXLPipeline:
                     unload_all_models_except("logo")
                 _logo_pipeline = _load_logo_pipeline()
     return _logo_pipeline
+
+
+def _remote_text_encoder(prompt: str, device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Call the official remote text encoder for FLUX.2 [dev].
+    Returns prompt_embeds and pooled_prompt_embeds tensors.
+    """
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HUGGINGFACE_HUB_TOKEN or HF_TOKEN required for FLUX.2 remote text encoder")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info("Calling remote text encoder for FLUX.2...")
+    response = requests.post(
+        FLUX2_REMOTE_TEXT_ENCODER_URL,
+        json={"prompt": [prompt]},
+        headers=headers,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    # The endpoint returns serialized torch tensors
+    data = torch.load(io.BytesIO(response.content), map_location=device)
+    logger.info("Remote text encoder returned embeddings successfully")
+
+    # Handle different return formats from the endpoint
+    if isinstance(data, dict):
+        prompt_embeds = data.get("prompt_embeds", data.get("embeddings"))
+        pooled_prompt_embeds = data.get("pooled_prompt_embeds", data.get("pooled_embeddings"))
+    elif isinstance(data, (list, tuple)) and len(data) >= 2:
+        prompt_embeds, pooled_prompt_embeds = data[0], data[1]
+    else:
+        prompt_embeds = data
+        pooled_prompt_embeds = None
+
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def _load_flux2_pipeline() -> FluxPipeline:
+    """
+    Load the FLUX.2-dev 4-bit quantized pipeline.
+    Uses remote text encoder for prompt embeddings.
+    """
+    device = get_device()
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+    logger.info("Loading FLUX.2-dev 4-bit pipeline (%s) on %s", FLUX2_4BIT_MODEL_ID, device)
+
+    try:
+        # Unload other models first - FLUX.2 is large
+        logger.info("Unloading other models to make room for FLUX.2")
+        unload_all_models_except("flux2")
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"Available GPU memory before FLUX.2 load: {free_mem:.2f} GB")
+
+        # Load the 4-bit quantized pipeline
+        # Note: text_encoder is set to None since we use remote text encoder
+        pipeline = FluxPipeline.from_pretrained(
+            FLUX2_4BIT_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            token=token,
+        )
+
+        _disable_safety(pipeline)
+
+        try:
+            pipeline.to(device)
+        except Exception as exc:
+            logger.warning("FLUX.2 pipeline load to device failed (%s); enabling CPU offload.", exc)
+            try:
+                pipeline.enable_model_cpu_offload()
+            except Exception:
+                logger.warning("CPU offload failed; falling back to sequential CPU offload")
+                pipeline.enable_sequential_cpu_offload()
+
+        if hasattr(pipeline, 'enable_attention_slicing'):
+            pipeline.enable_attention_slicing()
+        if hasattr(pipeline, 'enable_vae_slicing'):
+            pipeline.enable_vae_slicing()
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory after FLUX.2 load: {free_mem:.2f} GB free")
+
+    except Exception as exc:
+        logger.exception("Failed to initialize FLUX.2 pipeline")
+        raise RuntimeError(f"Failed to load FLUX.2 pipeline: {exc}") from exc
+
+    return pipeline
+
+
+def get_flux2_pipeline() -> FluxPipeline:
+    """
+    Return a singleton FLUX.2-dev 4-bit pipeline.
+    """
+    global _flux2_pipeline
+    if _flux2_pipeline is None:
+        with _lock:
+            if _flux2_pipeline is None:
+                logger.info("Preparing to load FLUX.2 - unloading other models first")
+                unload_all_models_except("flux2")
+                _flux2_pipeline = _load_flux2_pipeline()
+    return _flux2_pipeline
+
+
+def generate_flux2(
+    prompt: str,
+    num_inference_steps: int = 24,
+    guidance_scale: float = 4.0,
+    width: int = 768,
+    height: int = 768,
+    seed: int | None = None,
+) -> "PIL.Image.Image":
+    """
+    Generate an image using FLUX.2-dev with remote text encoder.
+    This is a convenience wrapper that handles the remote text encoder call.
+    """
+    import PIL.Image
+
+    pipe = get_flux2_pipeline()
+    device = pipe.device if hasattr(pipe, 'device') else get_device()
+
+    # Get embeddings from remote text encoder
+    prompt_embeds, pooled_prompt_embeds = _remote_text_encoder(prompt, str(device))
+
+    # Create generator for reproducibility
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+    # Generate with prompt embeddings
+    result = pipe(
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        width=width,
+        height=height,
+        generator=generator,
+    )
+
+    return result.images[0]
