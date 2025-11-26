@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import uuid
 import secrets
 import string
 import threading
@@ -2002,11 +2003,11 @@ def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBen
     from .models import BenchRun, BenchRunResult
 
     try:
-        uuid.UUID(str(run_id))
+        run_uuid = uuid.UUID(str(run_id))
     except Exception:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run = db.query(BenchRun).filter(BenchRun.id == run_id).first()
+    run = db.query(BenchRun).filter(BenchRun.id == run_uuid).first()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -2041,7 +2042,12 @@ def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBen
         else:
             desired = desired_params.get(engine, {})
             if run.current_engine == engine:
-                status = "loading_model" if run.status == "loading_model" else ("running" if run.status == "running" else "pending")
+                if run.status == "loading_model":
+                    status = "loading_model"
+                elif run.status == "running":
+                    status = "running"
+                else:
+                    status = "pending"
             else:
                 status = "pending"
             by_engine[engine] = NerdBenchEngineStatus(
