@@ -8,11 +8,13 @@ import secrets
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+from PIL import Image
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal, get_db
@@ -212,7 +214,7 @@ def _bench_record_run(
 # ---------------------------------------------------------------------------
 
 
-def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], resolution: int | None, tf32_default: bool | None):
+def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], resolution: int | None, tf32_default: bool | None, scoring_device: str = "cpu"):
     """Background worker to process a bench run using the shared queue."""
     db = SessionLocal()
     job = None
@@ -494,6 +496,83 @@ def _run_bench_worker(run_id: str, engines_payload: list[BenchEngineSettings], r
         run.current_engine = None
         db.commit()
 
+        # === SCORING PHASE ===
+        # Score all generated images with CLIP and aesthetic models
+        if run.status == "done":
+            logger.info(f"Starting scoring phase on {scoring_device}")
+            run.status = "scoring"
+            db.commit()
+
+            # Unload all generation models first to free GPU memory
+            try:
+                unload_all_models_except(None)
+                free_cuda_memory()
+            except Exception:
+                pass
+
+            scoring_load_ms = 0
+            scoring_inference_ms = 0
+
+            try:
+                # Import metrics models
+                from ..metrics_models import MetricsConfig, ClipScorer, AestheticScorer
+
+                # Map scoring_device to torch device
+                device = "cuda" if scoring_device == "gpu" and torch.cuda.is_available() else "cpu"
+
+                # Load scoring models
+                scoring_load_start = time.perf_counter()
+                cfg = MetricsConfig(device=device)
+                clip_scorer = ClipScorer(cfg)
+                aesthetic_scorer = AestheticScorer(cfg)
+                scoring_load_ms = int((time.perf_counter() - scoring_load_start) * 1000)
+                logger.info(f"Scoring models loaded in {scoring_load_ms}ms on {device}")
+
+                # Score all images from this run
+                results = db.query(BenchRunResult).filter(BenchRunResult.run_id == run.id).all()
+                scoring_inference_start = time.perf_counter()
+
+                for result in results:
+                    try:
+                        img = Image.open(result.image_path).convert("RGB")
+                        result.clip_score = clip_scorer.score(img, run.prompt)
+                        result.aesthetic_score = aesthetic_scorer.score(img)
+                        result.metrics_status = "complete"
+                        result.metrics_updated_at = datetime.now(timezone.utc)
+                        logger.info(f"Scored {result.engine}: CLIP={result.clip_score:.3f}, aesthetic={result.aesthetic_score:.2f}")
+                    except Exception as score_exc:
+                        logger.warning(f"Scoring failed for {result.engine}: {score_exc}")
+                        result.metrics_status = "error"
+                        result.metrics_updated_at = datetime.now(timezone.utc)
+
+                scoring_inference_ms = int((time.perf_counter() - scoring_inference_start) * 1000)
+
+                # Cleanup scoring models
+                try:
+                    clip_scorer.unload()
+                    aesthetic_scorer.unload()
+                    free_cuda_memory()
+                except Exception:
+                    pass
+
+            except Exception as scoring_exc:
+                logger.exception(f"Scoring phase failed: {scoring_exc}")
+                # Mark all results as error if scoring completely failed
+                results = db.query(BenchRunResult).filter(BenchRunResult.run_id == run.id).all()
+                for result in results:
+                    if result.metrics_status is None:
+                        result.metrics_status = "error"
+                        result.metrics_updated_at = datetime.now(timezone.utc)
+
+            # Update run with scoring metadata
+            run.scoring_device = scoring_device
+            run.scoring_load_ms = scoring_load_ms
+            run.scoring_inference_ms = scoring_inference_ms
+            run.scoring_total_ms = scoring_load_ms + scoring_inference_ms
+            run.status = "done"
+            db.commit()
+            logger.info(f"Scoring complete: load={scoring_load_ms}ms, inference={scoring_inference_ms}ms, total={run.scoring_total_ms}ms")
+
         # Warm flux back up for live traffic
         try:
             unload_all_models_except("flux")
@@ -554,6 +633,9 @@ def enqueue_nerd_bench(
                 detail=f"{eng.engine} guidance must be between {limits['guidance_min']} and {limits['guidance_max']}",
             )
 
+    # Get scoring device from request (default: cpu)
+    scoring_device = payload.scoring_device or "cpu"
+
     bench_run = BenchRun(
         session_id=session_id,
         prompt=prompt,
@@ -563,6 +645,7 @@ def enqueue_nerd_bench(
         resolution=resolution,
         tf32_enabled=tf32_default,
         engines_json=json.dumps([e.model_dump() for e in payload.engines]),
+        scoring_device=scoring_device,
     )
     db.add(bench_run)
     db.commit()
@@ -572,7 +655,7 @@ def enqueue_nerd_bench(
     try:
         threading.Thread(
             target=_run_bench_worker,
-            args=(str(bench_run.id), payload.engines, resolution, tf32_default),
+            args=(str(bench_run.id), payload.engines, resolution, tf32_default, scoring_device),
             daemon=True,
         ).start()
     except Exception as exc:
@@ -625,6 +708,9 @@ def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBen
                     seed=res.seed,
                     tf32=res.tf32_enabled,
                     tf32_enabled=res.tf32_enabled,
+                    clip_score=res.clip_score,
+                    aesthetic_score=res.aesthetic_score,
+                    metrics_status=res.metrics_status,
                 )
             else:
                 desired = desired_params.get(engine, {})
@@ -656,6 +742,10 @@ def get_nerd_bench_status(run_id: str, db: Session = Depends(get_db)) -> NerdBen
             resolution=run.resolution,
             tf32_enabled=run.tf32_enabled,
             engines=by_engine,
+            scoring_device=run.scoring_device,
+            scoring_load_ms=run.scoring_load_ms,
+            scoring_inference_ms=run.scoring_inference_ms,
+            scoring_total_ms=run.scoring_total_ms,
         )
     except HTTPException:
         raise

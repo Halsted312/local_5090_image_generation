@@ -122,6 +122,12 @@ class BenchRun(Base):
     engines_json = Column(Text, nullable=True)  # original request engines config
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # Scoring metadata
+    scoring_device = Column(String(10), nullable=True)  # "cpu" or "gpu"
+    scoring_load_ms = Column(Integer, nullable=True)
+    scoring_inference_ms = Column(Integer, nullable=True)
+    scoring_total_ms = Column(Integer, nullable=True)
+
     results = relationship(
         "BenchRunResult",
         back_populates="run",
@@ -177,5 +183,11 @@ class BenchRunResult(Base):
     model_dtype = Column(String(20), nullable=True)  # e.g., "bfloat16", "float16"
     quantization = Column(String(20), nullable=True)  # e.g., "4bit", "8bit", "none"
     uses_remote_encoder = Column(Boolean, nullable=True)  # True for FLUX2
+
+    # Image quality metrics (CPU-computed)
+    clip_score = Column(Float, nullable=True)
+    aesthetic_score = Column(Float, nullable=True)
+    metrics_status = Column(String(20), nullable=True)  # pending, complete, error
+    metrics_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     run = relationship("BenchRun", back_populates="results")

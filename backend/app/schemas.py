@@ -199,6 +199,7 @@ class NerdBenchRequest(BaseModel):
     tf32_enabled: bool | None = Field(True, alias="tf32_enabled")
     tf32Enabled: bool | None = None  # camelCase tolerance
     session_id: str | None = Field(None, alias="sessionId")
+    scoring_device: Literal["cpu", "gpu"] = Field("cpu", alias="scoring_device")
 
     @model_validator(mode="after")
     def normalize_tf32(self):
@@ -224,6 +225,10 @@ class NerdBenchEngineStatus(BaseModel):
     seed: int | None = None
     tf32: bool | None = None
     tf32_enabled: bool | None = None
+    # Scoring results
+    clip_score: float | None = None
+    aesthetic_score: float | None = None
+    metrics_status: str | None = None  # "complete", "error", or null
 
 
 class NerdBenchStatus(BaseModel):
@@ -235,3 +240,8 @@ class NerdBenchStatus(BaseModel):
     resolution: int | None
     tf32_enabled: bool | None
     engines: dict[str, NerdBenchEngineStatus]
+    # Scoring metadata
+    scoring_device: str | None = None
+    scoring_load_ms: int | None = None
+    scoring_inference_ms: int | None = None
+    scoring_total_ms: int | None = None

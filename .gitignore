@@ -26,3 +26,6 @@ backend/model_research/
 .gitignore
 research/
 research
+backend/data/images/bench
+backend/data/images/
+

@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:15
+    restart: unless-stopped
     environment:
       POSTGRES_USER: flexyface
       POSTGRES_PASSWORD: flexypass
@@ -12,6 +13,7 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -28,6 +30,7 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./prank_images:/data/prank_images
+      - ./backend/data:/app/data
       - gpu-coord:/gpu_coord
     ports:
       - "7999:7999"
@@ -43,12 +46,14 @@ services:
 
   frontend:
     build: ./frontend_archive_ignore
+    restart: unless-stopped
     ports:
       - "7080:80"
     depends_on:
       - backend
 
   benchmark:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: research/Dockerfile.benchmark

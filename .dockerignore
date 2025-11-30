@@ -5,3 +5,5 @@ __pycache__
 .env
 node_modules
 frontend_archive_ignore/node_modules
+backend/data/images/bench
+backend/data/images/
