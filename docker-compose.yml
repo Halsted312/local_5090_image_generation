@@ -44,6 +44,30 @@ services:
               count: 1
               capabilities: [gpu]
 
+  benchmark:
+    build:
+      context: .
+      dockerfile: research/Dockerfile.benchmark
+    env_file:
+      - .env
+    environment:
+      - GPU_COORD_PATH=/gpu_coord/status.json
+      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN:-}
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    volumes:
+      - gpu-coord:/gpu_coord
+      - hf_cache:/root/.cache/huggingface
+      - ./research:/workspace/research:ro
+      - ./research/benchmark_results:/workspace/benchmark_results
+    command: ["python", "research/benchmarks/efficient_benchmark_runner.py", "--yes"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   hf_cache:
   db_data:
