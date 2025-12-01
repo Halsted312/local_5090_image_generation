@@ -54,6 +54,10 @@ services:
       - GPU_COORD_PATH=/gpu_coord/status.json
       - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN:-}
       - HF_HUB_ENABLE_HF_TRANSFER=1
+      - TORCH_NUM_THREADS=20
+      - OMP_NUM_THREADS=20
+      - MKL_NUM_THREADS=20
+      - NUMEXPR_MAX_THREADS=20
     volumes:
       - gpu-coord:/gpu_coord
       - hf_cache:/root/.cache/huggingface
