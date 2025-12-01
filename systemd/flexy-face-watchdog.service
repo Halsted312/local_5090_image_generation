@@ -1,0 +1,7 @@
+[Unit]
+Description=Flexy Face Watchdog - Check and restart if needed
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/halsted/Python/flexy-face
+ExecStart=/usr/bin/docker compose up -d

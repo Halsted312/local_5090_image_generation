@@ -17,6 +17,7 @@ from ..flux_models import (
     get_realvis_pipeline,
     get_sd3_pipeline,
     get_text_pipeline,
+    unload_current_model,
 )
 from ..models import GenerationLog, GenerationMetric
 from ..router_engine import RoutingDecision, route_prompt
@@ -177,6 +178,9 @@ def execute_model(model_id: str, request: TextGenerateRequest) -> tuple[Image.Im
         finally:
             release_gpu_coord(owner="backend")
             free_cuda_memory()
+            # Unload model completely to free GPU VRAM and system RAM
+            logger.info("Unloading model after generation to free memory...")
+            unload_current_model()
             # Brief pause to let CUDA allocator settle before next owner.
             time.sleep(0.5)
 

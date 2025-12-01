@@ -54,6 +54,51 @@ def _disable_safety(pipe) -> None:
         pass
 
 
+def unload_current_model():
+    """Unload whichever model is currently loaded to free GPU and RAM."""
+    global _text_pipeline, _realvis_pipeline, _sd3_pipeline, _logo_pipeline, _flux2_pipeline
+    import gc
+
+    logger.info("Unloading current model to free GPU/RAM...")
+
+    # Find and unload whichever pipeline is loaded
+    if _text_pipeline is not None:
+        logger.info("Unloading FLUX pipeline")
+        del _text_pipeline
+        _text_pipeline = None
+    if _realvis_pipeline is not None:
+        logger.info("Unloading RealVis pipeline")
+        del _realvis_pipeline
+        _realvis_pipeline = None
+    if _sd3_pipeline is not None:
+        logger.info("Unloading SD3 pipeline")
+        del _sd3_pipeline
+        _sd3_pipeline = None
+    if _logo_pipeline is not None:
+        logger.info("Unloading Logo/HiDream pipeline")
+        del _logo_pipeline
+        _logo_pipeline = None
+    if _flux2_pipeline is not None:
+        logger.info("Unloading FLUX.2 pipeline")
+        del _flux2_pipeline
+        _flux2_pipeline = None
+
+    # Aggressive cleanup
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+        logger.info(f"After unload: GPU has {free_mem:.2f} GB free")
+
+
 def unload_all_models_except(keep_model: str | None = None):
     """Unload all models except the specified one to free GPU memory."""
     global _text_pipeline, _realvis_pipeline, _sd3_pipeline, _logo_pipeline, _flux2_pipeline
@@ -128,30 +173,38 @@ def unload_all_models_except(keep_model: str | None = None):
 
 
 def _load_text_pipeline() -> FluxPipeline:
-    """Instantiate the text-to-image FLUX pipeline."""
+    """Instantiate the text-to-image FLUX pipeline directly on GPU."""
     device = get_device()
     token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-    logger.info("Loading FLUX text-to-image pipeline (%s) on %s", FLUX_TEXT_MODEL_ID, device)
+    logger.info("Loading FLUX text-to-image pipeline (%s) DIRECTLY to %s", FLUX_TEXT_MODEL_ID, device)
     try:
         if device == "cuda":
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory before FLUX load: {free_mem:.2f} GB free")
+
+        # Load directly to GPU - no CPU staging
         pipeline = FluxPipeline.from_pretrained(
             FLUX_TEXT_MODEL_ID,
             torch_dtype=torch.bfloat16,
             token=token,
+            device_map="balanced" if device == "cuda" else None,
+            low_cpu_mem_usage=True,
         )
         _disable_safety(pipeline)
-        try:
+
+        # Only move if not using device_map
+        if device == "cuda" and not hasattr(pipeline, 'hf_device_map'):
             pipeline.to(device)
-        except Exception as exc:
-            logger.warning("Text pipeline load to device failed (%s); enabling CPU offload.", exc)
-            try:
-                pipeline.enable_model_cpu_offload()
-            except Exception:
-                logger.warning("CPU offload failed; falling back to CPU")
-                pipeline.to("cpu")
+
         pipeline.enable_attention_slicing()
         pipeline.enable_vae_slicing()
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory after FLUX load: {free_mem:.2f} GB free")
     except Exception as exc:
         logger.exception("Failed to initialize FLUX text pipeline")
         raise RuntimeError(f"Failed to load FLUX text pipeline: {exc}") from exc
@@ -175,21 +228,33 @@ def get_text_pipeline() -> FluxPipeline:
 def _load_realvis_pipeline() -> StableDiffusionXLPipeline:
     device = get_device()
     token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-    logger.info("Loading RealVisXL pipeline (%s) on %s", REALVIS_MODEL_ID, device)
+    logger.info("Loading RealVisXL pipeline (%s) DIRECTLY to %s", REALVIS_MODEL_ID, device)
     try:
         if device == "cuda":
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory before RealVis load: {free_mem:.2f} GB free")
+
         pipe = StableDiffusionXLPipeline.from_pretrained(
-            REALVIS_MODEL_ID, torch_dtype=torch.bfloat16, token=token
+            REALVIS_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            token=token,
+            device_map="balanced" if device == "cuda" else None,
+            low_cpu_mem_usage=True,
         )
         _disable_safety(pipe)
-        try:
+
+        if device == "cuda" and not hasattr(pipe, 'hf_device_map'):
             pipe.to(device)
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("RealVis pipeline OOM on GPU; enabling CPU offload.")
-            pipe.enable_model_cpu_offload()
+
         pipe.enable_attention_slicing()
         pipe.enable_vae_slicing()
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory after RealVis load: {free_mem:.2f} GB free")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to initialize RealVis pipeline")
         raise RuntimeError(f"Failed to load RealVis pipeline: {exc}") from exc
@@ -208,20 +273,32 @@ def get_realvis_pipeline() -> StableDiffusionXLPipeline:
 def _load_sd3_pipeline() -> StableDiffusion3Pipeline:
     device = get_device()
     token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-    logger.info("Loading SD3-Medium pipeline (%s) on %s", SD3_MODEL_ID, device)
+    logger.info("Loading SD3-Medium pipeline (%s) DIRECTLY to %s", SD3_MODEL_ID, device)
     try:
         if device == "cuda":
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory before SD3 load: {free_mem:.2f} GB free")
+
         pipe = StableDiffusion3Pipeline.from_pretrained(
-            SD3_MODEL_ID, torch_dtype=torch.bfloat16, token=token
+            SD3_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            token=token,
+            device_map="balanced" if device == "cuda" else None,
+            low_cpu_mem_usage=True,
         )
         _disable_safety(pipe)
-        try:
+
+        if device == "cuda" and not hasattr(pipe, 'hf_device_map'):
             pipe.to(device)
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("SD3 pipeline OOM on GPU; enabling CPU offload.")
-            pipe.enable_model_cpu_offload()
+
         pipe.enable_attention_slicing()
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"GPU memory after SD3 load: {free_mem:.2f} GB free")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to initialize SD3 pipeline")
         raise RuntimeError(f"Failed to load SD3 pipeline: {exc}") from exc
