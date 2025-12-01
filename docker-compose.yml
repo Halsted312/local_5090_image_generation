@@ -3,9 +3,9 @@ services:
     image: postgres:15
     restart: unless-stopped
     environment:
-      POSTGRES_USER: flexyface
-      POSTGRES_PASSWORD: flexypass
-      POSTGRES_DB: flexyface
+      POSTGRES_USER: ${POSTGRES_USER:-flexyface}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flexypass}
+      POSTGRES_DB: ${POSTGRES_DB:-flexyface}
     volumes:
       - db_data:/var/lib/postgresql/data
     ports:
@@ -36,40 +36,6 @@ services:
       - "7999:7999"
     depends_on:
       - db
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  frontend:
-    build: ./frontend_archive_ignore
-    restart: unless-stopped
-    ports:
-      - "7080:80"
-    depends_on:
-      - backend
-
-  benchmark:
-    restart: unless-stopped
-    build:
-      context: .
-      dockerfile: research/Dockerfile.benchmark
-    env_file:
-      - .env
-    environment:
-      - GPU_COORD_PATH=/gpu_coord/status.json
-      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
-      - HF_HUB_ENABLE_HF_TRANSFER=1
-      - HF_HOME=/workspace/hf_cache
-    volumes:
-      - gpu-coord:/gpu_coord
-      - hf_cache:/workspace/hf_cache
-      - ./research:/workspace/research:ro
-      - ./research/benchmark_results:/workspace/benchmark_results
-    command: ["python", "research/benchmarks/efficient_benchmark_runner.py"]
     deploy:
       resources:
         reservations:
